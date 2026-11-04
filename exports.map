@@ -1,0 +1,7 @@
+{
+  global:
+    OfxGetPlugin;
+    OfxGetNumberOfPlugins;
+  local:
+    *;
+};

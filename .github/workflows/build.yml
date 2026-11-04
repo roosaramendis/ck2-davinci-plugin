@@ -1,0 +1,67 @@
+# Builds the DaVinci Resolve OFX plugin (CorridorKey2.ofx.bundle) for
+# Linux, Windows and macOS (universal: Apple Silicon + Intel).
+# Push a tag like "v1" to also attach the zips to a GitHub release.
+name: Build ck2-davinci-plugin
+
+on:
+  push:
+    tags: ["v*"]
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, name: linux }     # older glibc = runs on more distros
+          - { os: windows-2022, name: windows }
+          - { os: macos-14,     name: macos }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Check exports (Linux)
+        if: matrix.name == 'linux'
+        run: |
+          nm -D --defined-only build/CorridorKey2.ofx.bundle/Contents/Linux-x86-64/CorridorKey2.ofx | grep OfxGet
+          ldd build/CorridorKey2.ofx.bundle/Contents/Linux-x86-64/CorridorKey2.ofx
+
+      - name: Check exports (macOS)
+        if: matrix.name == 'macos'
+        run: |
+          lipo -info build/CorridorKey2.ofx.bundle/Contents/MacOS/CorridorKey2.ofx
+          nm -gU build/CorridorKey2.ofx.bundle/Contents/MacOS/CorridorKey2.ofx | grep OfxGet
+          codesign --force --deep --sign - build/CorridorKey2.ofx.bundle
+
+      - name: Zip
+        shell: bash
+        run: |
+          cd build
+          if [ "${{ matrix.name }}" = windows ]; then
+            7z a ../CorridorKey2-ofx-${{ matrix.name }}.zip CorridorKey2.ofx.bundle
+          else
+            zip -r ../CorridorKey2-ofx-${{ matrix.name }}.zip CorridorKey2.ofx.bundle
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CorridorKey2-ofx-${{ matrix.name }}
+          path: CorridorKey2-ofx-${{ matrix.name }}.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: CorridorKey2-ofx-${{ matrix.name }}.zip

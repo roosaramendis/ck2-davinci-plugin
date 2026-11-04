@@ -85,6 +85,9 @@ EngineConfig loadConfig() {
         else if (k == "cache_dir") c.cacheDir = v;
         else if (k == "temp_dir") c.tempDir = v;
         else if (k == "ffmpeg") c.ffmpeg = v;
+        else if (k == "roto_daemon") c.rotoScript = v;
+        else if (k == "roto_picker") c.pickerScript = v;
+        else if (k == "sam_model") c.samModel = v;
     }
     // Only "engine=" is required; the venv Python is found inside it.
     if (c.python.empty() && !c.engine.empty()) {
@@ -111,6 +114,15 @@ EngineConfig loadConfig() {
         c.error = "Apple GPU wrapper missing (" + c.wrapper + ").";
     } else {
         c.ok = true;
+    }
+    if (c.rotoScript.empty()) c.rotoScript = (fs::path(c.path).parent_path() / "roto_daemon.py").string();
+    if (c.pickerScript.empty()) c.pickerScript = (fs::path(c.path).parent_path() / "roto_picker.py").string();
+    if (c.samModel.empty()) {
+#ifdef __APPLE__
+        c.samModel = "facebook/sam2.1-hiera-base-plus";
+#else
+        c.samModel = "facebook/sam2.1-hiera-large";
+#endif
     }
     if (c.cacheDir.empty()) {
 #ifdef _WIN32
@@ -236,7 +248,10 @@ static std::wstring envBlock(const std::map<std::string, std::string>& extraEnv)
         }
         FreeEnvironmentStringsW(cur);
     }
-    for (auto& [k, v] : extraEnv) vars[widen(k)] = widen(v);
+    for (auto& [k, v] : extraEnv) {
+        if (v == kEnvUnset) vars.erase(widen(k));
+        else vars[widen(k)] = widen(v);
+    }
     std::wstring block;
     for (auto& [k, v] : vars) { block += k; block += L'='; block += v; block += L'\0'; }
     block += L'\0';
@@ -350,7 +365,10 @@ struct ChildPrep {
             const char* eq = std::strchr(*e, '=');
             if (eq) vars[std::string(*e, eq - *e)] = eq + 1;
         }
-        for (auto& [k, v] : extraEnv) vars[k] = v;
+        for (auto& [k, v] : extraEnv) {
+            if (v == kEnvUnset) vars.erase(k);
+            else vars[k] = v;
+        }
         for (auto& [k, v] : vars) envStrings.push_back(k + "=" + v);
         for (auto& e : envStrings) envp.push_back(const_cast<char*>(e.c_str()));
         envp.push_back(nullptr);

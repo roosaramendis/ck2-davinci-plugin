@@ -54,6 +54,8 @@ target_include_directories(tinyexr_lib PUBLIC ${tinyexr_SOURCE_DIR} ${tinyexr_SO
 
 add_library(CorridorKey2 MODULE
   src/CorridorKeyOFX.cpp
+  src/PassOFX.cpp
+  src/RotoOFX.cpp
   src/engine.cpp
   src/job.cpp
   src/exr_io.cpp)

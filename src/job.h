@@ -17,9 +17,11 @@
 namespace ck {
 
 struct JobSpec {
+    std::string kind = "key";   // "key" (CorridorKey) or "roto" (SAM 2 tracking)
     int start = 0, count = 0;   // host frame range at the time of Key clip
     bool linear = false;        // input is scene-linear
     bool hint = false;          // a Hint clip is connected
+    bool hintFirstOnly = false; // use only the first frame of the hint (engine carries it forward)
     bool lowVram = false;
     int window = 0;             // 0 = auto, else hann chunk size
     double despill = 0.5, hintQ = 0.95, fps = 24.0;
@@ -55,6 +57,44 @@ void waitForWrites();  // tests
 bool launchJob(const std::string& cacheDir, const std::string& id, bool partialOk, std::string* err);
 void cancelJob(const std::string& cacheDir, const std::string& id);
 void forgetJob(const std::string& cacheDir, const std::string& id);
+
+// ------------------------------------------------------------------ roto (SAM 2)
+// Roto jobs live in <cache>/roto/<id>/ and are handled by roto_daemon.py.
+std::string rotoRoot(const std::string& cacheDir);
+bool ensureRotoDaemon(const std::string& rotoRoot, std::string* err);
+// Opens the picker window (frame image already written by the node).
+bool openPicker(const std::string& rotoRoot, const std::string& id, int idx, const std::string& model,
+                std::string* err);
+bool pickerOpen(const std::string& rotoRoot, const std::string& id);
+struct Prompts {
+    bool valid = false;
+    int frame = 0, objects = 0;
+};
+Prompts readPrompts(const std::string& rotoRoot, const std::string& id);
+struct PreviewState {
+    bool pending = false;  // asked, no answer yet
+    std::string error;
+};
+PreviewState previewState(const std::string& rotoRoot, const std::string& id);
+std::string previewDir(const std::string& rotoRoot, const std::string& id);
+std::string previewMaskPath(const std::string& rotoRoot, const std::string& id, int idx);
+std::string trackMaskPath(const std::string& rotoRoot, const std::string& id, int idx);
+// Track the picked selection. Starts now if frames are ready, else after playback captured them.
+bool requestTrack(const std::string& rotoRoot, const std::string& id, std::string* err);
+bool trackWanted(const std::string& rotoRoot, const std::string& id);
+
+// Key names: the CorridorKey node publishes its key under a short name
+// (<cache>/names/<name>.key) so Pass nodes / the Fusion macro can find it.
+std::string safeKeyName(const std::string& name);
+bool registerKeyName(const std::string& cacheDir, const std::string& name, const std::string& id, int start,
+                     int count, bool linear);
+struct KeyRef {
+    std::string id;
+    int start = 0, count = 0;
+    bool linear = false;
+    bool valid() const { return !id.empty() && count > 0; }
+};
+KeyRef lookupKeyName(const std::string& cacheDir, const std::string& name);  // cached ~0.5 s
 
 std::string outFramePath(const std::string& cacheDir, const std::string& id, const char* kind, int outIdx);
 

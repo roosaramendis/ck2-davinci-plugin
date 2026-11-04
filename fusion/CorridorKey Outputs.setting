@@ -1,0 +1,82 @@
+{
+	Tools = ordered() {
+		CorridorKeyOutputs = MacroOperator {
+			CtrlWZoom = false,
+			NameSet = true,
+			CustomData = {
+				HelpPage = "https://github.com/nikopueringer/CorridorKey2.0",
+			},
+			Inputs = ordered() {
+				KeyName = InstanceInput {
+					SourceOp = "Alpha",
+					Source = "keyName",
+					Name = "Key name",
+					Default = "",
+				},
+				Input = InstanceInput {
+					SourceOp = "Cutout",
+					Source = "Source",
+					Name = "Source (optional)",
+				},
+			},
+			Outputs = {
+				Cutout = InstanceOutput {
+					SourceOp = "Cutout",
+					Source = "Output",
+					Name = "Cutout",
+				},
+				Alpha = InstanceOutput {
+					SourceOp = "Alpha",
+					Source = "Output",
+					Name = "Alpha",
+				},
+				Foreground = InstanceOutput {
+					SourceOp = "Foreground",
+					Source = "Output",
+					Name = "Foreground",
+				},
+				Checker = InstanceOutput {
+					SourceOp = "Checker",
+					Source = "Output",
+					Name = "Checker",
+				},
+			},
+			ViewInfo = GroupInfo { Pos = { 0, 0 } },
+			Tools = ordered() {
+				Alpha = ofx.io.github.ck2gui.CorridorKey2Pass {
+					CtrlWZoom = false,
+					Inputs = {
+						keyName = Input { Value = "", },
+						pass = Input { Value = 1, },
+					},
+					ViewInfo = OperatorInfo { Pos = { 0, 0 } },
+				},
+				Cutout = ofx.io.github.ck2gui.CorridorKey2Pass {
+					CtrlWZoom = false,
+					Inputs = {
+						keyName = Input { Value = "", Expression = "Alpha.keyName", },
+						pass = Input { Value = 0, },
+					},
+					ViewInfo = OperatorInfo { Pos = { 0, 33 } },
+				},
+				Foreground = ofx.io.github.ck2gui.CorridorKey2Pass {
+					CtrlWZoom = false,
+					Inputs = {
+						keyName = Input { Value = "", Expression = "Alpha.keyName", },
+						pass = Input { Value = 2, },
+					},
+					ViewInfo = OperatorInfo { Pos = { 0, 66 } },
+				},
+				Checker = ofx.io.github.ck2gui.CorridorKey2Pass {
+					CtrlWZoom = false,
+					Inputs = {
+						keyName = Input { Value = "", Expression = "Alpha.keyName", },
+						pass = Input { Value = 3, },
+					},
+					ViewInfo = OperatorInfo { Pos = { 0, 99 } },
+				},
+			},
+		},
+	},
+	ActiveTool = "CorridorKeyOutputs"
+}

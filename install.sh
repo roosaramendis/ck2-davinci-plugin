@@ -5,6 +5,7 @@
 #   bash install.sh --engine DIR         use this CorridorKey2.0 engine folder
 #   bash install.sh --prebuilt           Linux: skip compiling, use prebuilt/ zip
 #   bash install.sh --connect-only       only (re)write the config (engine moved)
+#   bash install.sh --no-sam             skip downloading the SAM 2 model (Roto node)
 #   bash install.sh --uninstall          remove the plugin from Resolve's OFX folder
 set -euo pipefail
 
@@ -19,6 +20,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     CACHE_DIR="$HOME/Library/Caches/corridorkey-ofx"
     TEMP_DIR="$HOME/Library/Caches/corridorkey-tmp"
     BACKEND=mps
+    SAM_MODEL=facebook/sam2.1-hiera-base-plus
+    MACRO_DIR="$HOME/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Macros"
     export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 else
     OS=linux
@@ -27,6 +30,8 @@ else
     CACHE_DIR="$HOME/.cache/corridorkey-ofx"   # not /tmp: RAM-backed on CachyOS
     TEMP_DIR="$HOME/.cache/corridorkey-tmp"
     BACKEND=cuda
+    SAM_MODEL=facebook/sam2.1-hiera-large
+    MACRO_DIR="$HOME/.local/share/DaVinciResolve/Fusion/Macros"
 fi
 CONF="$CONF_DIR/ofx.conf"
 
@@ -34,11 +39,12 @@ say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m ✓\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m ✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
-ENGINE="" MODE=full PREBUILT=0
+ENGINE="" MODE=full PREBUILT=0 SAM=1
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --engine) ENGINE="${2:?--engine needs a folder}"; shift 2 ;;
         --prebuilt) PREBUILT=1; shift ;;
+        --no-sam) SAM=0; shift ;;
         --connect-only) MODE=connect; shift ;;
         --uninstall) MODE=uninstall; shift ;;
         -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
@@ -51,6 +57,7 @@ if [[ $MODE == uninstall ]]; then
     if [[ -d "$OFX_DIR/$BUNDLE" ]]; then
         say "Removing $OFX_DIR/$BUNDLE (asks for your password)"
         $SUDO rm -rf "$OFX_DIR/$BUNDLE"
+        rm -f "$MACRO_DIR/CorridorKey Outputs.setting"
         ok "Plugin removed. Cached keys are still in $CACHE_DIR (delete by hand if you want)."
     else
         ok "Plugin isn't installed."
@@ -94,6 +101,8 @@ connect() {
         cp "$HERE/support/apple_gpu.py" "$CONF_DIR/apple_gpu.py"
         wrapper="$CONF_DIR/apple_gpu.py"
     fi
+    cp "$HERE/support/roto_daemon.py" "$CONF_DIR/roto_daemon.py"   # SAM 2 worker for the Roto node
+    cp "$HERE/support/roto_picker.py" "$CONF_DIR/roto_picker.py"   # the Roto node's picker window
     ff="$(command -v ffmpeg || true)"   # the engine needs ffmpeg even for EXR output
     if [[ -z "$ff" ]]; then
         echo "   warning: ffmpeg not found – install it (the engine refuses to start without it)"
@@ -107,6 +116,9 @@ connect() {
         if [[ -n "$ff" ]]; then echo "ffmpeg=$ff"; fi
         echo "cache_dir=$CACHE_DIR"
         echo "temp_dir=$TEMP_DIR"
+        echo "roto_daemon=$CONF_DIR/roto_daemon.py"
+        echo "roto_picker=$CONF_DIR/roto_picker.py"
+        echo "sam_model=$SAM_MODEL"
     } > "$CONF"
     ok "Connected: wrote $CONF"
 }
@@ -158,10 +170,41 @@ ok "Installed $OFX_DIR/$BUNDLE"
 
 connect
 
+# ---------------------------------------------------------------- Fusion macro (multi-output)
+mkdir -p "$MACRO_DIR"
+cp "$HERE/fusion/CorridorKey Outputs.setting" "$MACRO_DIR/"
+ok "Fusion macro: $MACRO_DIR/CorridorKey Outputs.setting"
+
+# ---------------------------------------------------------------- picker window needs PySide6
+if ! "$PY" -c "import PySide6" 2>/dev/null; then
+    say "Adding PySide6 to the engine's Python (for the Roto picker window)"
+    if command -v uv >/dev/null; then
+        uv pip install --python "$PY" "PySide6>=6.7" || echo "   warning: PySide6 install failed – the Roto picker won't open"
+    else
+        "$PY" -m pip install "PySide6>=6.7" || echo "   warning: PySide6 install failed – the Roto picker won't open"
+    fi
+fi
+
+# ---------------------------------------------------------------- SAM 2 model for the Roto node
+if [[ $SAM == 1 ]]; then
+    if "$PY" -c "import transformers; transformers.Sam2VideoModel" 2>/dev/null; then
+        say "Downloading $SAM_MODEL for the Roto node (once, ~0.9 GB; skip with --no-sam)"
+        if "$PY" -c "from huggingface_hub import snapshot_download as d; d('$SAM_MODEL')" 2>"$CONF_DIR/sam_download.log"; then
+            ok "SAM 2 model ready"
+        else
+            echo "   warning: couldn't download $SAM_MODEL now; the Roto node will try on first use (details: $CONF_DIR/sam_download.log)"
+        fi
+    else
+        echo "   warning: this engine's transformers has no SAM 2 – the Roto node needs:"
+        echo "            $PY -m pip install -U 'transformers>=4.56'"
+    fi
+fi
+
 cat <<EOF
 
 Done. Next:
   1. Restart DaVinci Resolve.
-  2. Effects → OpenFX → Keying → CorridorKey 2.0 — drag it onto a clip.
-  3. In the Inspector press "Key clip" and wait for the progress bar.
+  2. Effects → OpenFX → Keying: CorridorKey 2.0, CorridorKey Pass, CorridorKey Roto.
+     Fusion page: Add Tool → Macros → CorridorKey Outputs (Cutout/Alpha/FG/Checker outputs).
+  3. Press "Key clip" in the Inspector, then play the clip once.
 EOF

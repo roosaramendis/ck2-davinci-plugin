@@ -9,6 +9,18 @@ the plugin doesn't need that app): NVIDIA (CUDA) on
 Linux and Windows, or the Apple GPU on Macs. It then caches the result, so
 playback and scrubbing are instant.
 
+## The nodes
+
+| Node | What it does |
+|---|---|
+| **CorridorKey 2.0** | Keys the clip (in the background) and outputs one pass: cutout, matte, foreground or checker. |
+| **CorridorKey Pass** | Outputs one pass of a key, found by its **Key name**. Use several to get several passes at once; nothing is keyed twice. |
+| **CorridorKey Outputs** (Fusion macro) | One node with **Cutout / Alpha / Foreground / Checker** outputs, built from four Pass nodes. Fusion page only. |
+| **CorridorKey Roto** | Click-to-track roto with SAM 2.1: click / drag rectangles on the characters in a picker window, it tracks them through the clip and outputs a **hint matte** for CorridorKey's Hint input, or the **source with everything else filled with screen colour**. |
+
+An OpenFX node can only have one output, so several passes come from Pass nodes
+(or the macro, which bundles them).
+
 ## Install
 
 ### Linux and macOS
@@ -53,8 +65,12 @@ installs them with pacman. On a Mac, run `xcode-select --install` and
    engine=C:\path\to\CorridorKey2.0
    ```
    Optional extra lines: `ffmpeg=C:\path\to\ffmpeg.exe` and
-   `cache_dir=D:\corridorkey-cache`.
-4. Restart Resolve.
+   `cache_dir=D:\corridorkey-cache`. For the Roto node, also copy
+   `support\roto_daemon.py` and `support\roto_picker.py` next to that `ofx.conf`
+   and install PySide6 into the engine's Python.
+4. For the multi-output macro, copy `fusion\CorridorKey Outputs.setting` to
+   `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Macros\`.
+5. Restart Resolve.
 
 | OS      | Plugin folder                              | Config file                                        |
 |---------|--------------------------------------------|----------------------------------------------------|
@@ -95,6 +111,43 @@ If a frame still shows the `KEYING` banner after keying is done, press
 **Update status**. `KEY MISSING` means the cached key is gone, for example after
 moving the project to another computer or clearing the cache. Key again.
 
+### Several passes at once
+
+The CorridorKey 2.0 node shows a **Key name** (for example `key-3f2a`). You can
+rename it.
+- **CorridorKey Pass** (any page): type that name and pick a **Pass**. Add as
+  many as you need.
+- **Fusion page:** *Add Tool → Macros → CorridorKey Outputs*, then type the key
+  name once. The node has Cutout, Alpha, Foreground and Checker outputs.
+
+### Keep only one character: CorridorKey Roto
+
+1. Wire it up. The clip goes into **both** nodes: MediaIn → **CorridorKey Roto**,
+   and MediaIn → **CorridorKey 2.0**. The Roto output goes into CorridorKey's
+   **Hint** input (the second, green triangle).
+2. Go to a frame where the character is clear and press **Pick character…**. A
+   window opens on that frame:
+   - **click** on the character to keep it,
+   - **right-click** on things to remove (another person, a light stand),
+   - **drag** a rectangle around a character or area; each rectangle is its own
+     object, so add as many as you need,
+   - wheel zooms, middle-drag pans, Ctrl+Z undoes.
+
+   After each change the mask is shown in red after a moment; the first time
+   takes longer while SAM 2 loads. Press **Use this selection** when it's right.
+3. Press **Track clip**, then **play the clip once**. Tracking then runs in the
+   background (`ROTO: TRACKING 40%`). If you pick again later, Track clip
+   doesn't need another playback.
+4. **Output** (default **Hint matte**). **Overlay** shows the mask over the
+   picture to check it. **Garbage-filled source** fills everything outside the
+   character with screen colour; use it on the Edit/Color page, where there's no
+   Hint input, by putting CorridorKey 2.0 *after* the Roto node.
+5. Wait for **✓ Tracked** in the Roto status, *then* press Key clip on the
+   CorridorKey node.
+
+With a Hint connected, **Hint is: First frame only** gives CorridorKey just the
+first frame's matte and lets it carry it forward.
+
 ### Settings (used by the next Key clip)
 
 - **Input is:** match your timeline. Choose display-referred for normal
@@ -122,6 +175,10 @@ currently works in both. If a future feature needs Studio, its button will say
 so in Free instead of failing.
 
 ## Where things are kept
+
+The Roto node runs SAM 2 in a background helper (`roto_daemon.py`, in the engine's
+Python). It starts when needed and quits after 5 idle minutes to free GPU
+memory. Its data is in the `roto/` folder of the cache.
 
 Keys are cached as EXRs in `~/.cache/corridorkey-ofx` on Linux,
 `~/Library/Caches/corridorkey-ofx` on macOS, and `%LOCALAPPDATA%\corridorkey-ofx`

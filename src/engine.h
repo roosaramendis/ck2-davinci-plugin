@@ -17,6 +17,9 @@ struct EngineConfig {
     std::string cacheDir; // where keyed clips are cached
     std::string tempDir;  // engine temp (low-VRAM feature cache)
     std::string ffmpeg;   // full path; Resolve started from the Dock/menu has a short PATH
+    std::string rotoScript;  // roto_daemon.py (default: next to ofx.conf)
+    std::string pickerScript;  // roto_picker.py (default: next to ofx.conf)
+    std::string samModel;    // default SAM 2.1 model for the Roto node
     bool ok = false;
     std::string error;
     std::string path;     // which file was read
@@ -35,6 +38,9 @@ int runProcess(const std::vector<std::string>& argv,
                const std::string& cwd,
                const std::function<bool(const std::string&)>& onLine,
                std::string* startError);
+
+// Value for extraEnv that removes the variable instead of setting it.
+inline const char* kEnvUnset = "\x01unset";
 
 // Start a process that keeps running on its own (not tied to Resolve: it
 // survives Resolve closing). Output goes nowhere; the program logs by itself.

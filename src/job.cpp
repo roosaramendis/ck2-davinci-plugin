@@ -1,6 +1,7 @@
 #include "job.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -76,8 +77,8 @@ static const char* kWindowSizes[] = {"", "80", "48", "24", "8", "1"};
 
 std::string JobSpec::str() const {
     std::ostringstream o;
-    o << "start=" << start << "\ncount=" << count << "\nlinear=" << linear << "\nhint=" << hint
-      << "\nlow_vram=" << lowVram << "\nwindow=" << window << "\ndespill=" << despill
+    o << "kind=" << kind << "\nstart=" << start << "\ncount=" << count << "\nlinear=" << linear << "\nhint=" << hint
+      << "\nhint_first_only=" << hintFirstOnly << "\nlow_vram=" << lowVram << "\nwindow=" << window << "\ndespill=" << despill
       << "\nhint_quality=" << hintQ << "\nfps=" << fps << "\n";
     return o.str();
 }
@@ -91,11 +92,13 @@ JobSpec JobSpec::parse(const std::string& s) {
         if (eq == std::string::npos) continue;
         std::string k = line.substr(0, eq), v = line.substr(eq + 1);
         try {
-            if (k == "start") j.start = std::stoi(v);
+            if (k == "kind") j.kind = v;
+            else if (k == "start") j.start = std::stoi(v);
             else if (k == "count") j.count = std::stoi(v);
             else if (k == "linear") j.linear = v == "1";
             else if (k == "hint") j.hint = v == "1";
             else if (k == "low_vram") j.lowVram = v == "1";
+            else if (k == "hint_first_only") j.hintFirstOnly = v == "1";
             else if (k == "window") j.window = std::stoi(v);
             else if (k == "despill") j.despill = std::stod(v);
             else if (k == "hint_quality") j.hintQ = std::stod(v);
@@ -248,7 +251,8 @@ static void writerLoop() {
             m->inflight.erase(t.idx);
             if (ok) m->done.insert(t.idx);
             m->haveStatus = false;
-            complete = ok && m->spec.count > 0 && (int)m->done.size() >= m->spec.count;
+            complete = ok && m->spec.count > 0 && (int)m->done.size() >= m->spec.count &&
+                       (m->spec.kind != "roto" || fileExists(joinPath(dir, "want_track")));
         }
         if (complete) launchJob(t.cache, t.id, false, nullptr);
         {
@@ -325,6 +329,9 @@ bool captureFrame(const std::string& c, const std::string& id, int idx, std::vec
 
 // ------------------------------------------------------------------ launch
 
+bool startRotoTrackLocked(const std::string& root, const std::string& id, const std::string& dir, int count,
+                          std::string* err);
+
 static void failJob(const std::string& dir, const std::string& msg) {
     std::ofstream(joinPath(dir, "engine.log"), std::ios::app) << "[plugin] " << msg << "\n";
     writeTextAtomic(joinPath(dir, "exitcode"), "plugin");
@@ -343,6 +350,12 @@ bool launchJob(const std::string& c, const std::string& id, bool partialOk, std:
     if (fileExists(joinPath(dir, "launched"))) return true;
     if (fileExists(joinPath(dir, "exitcode"))) return fail("this job already ended; press Key clip again");
     if (!partialOk && (int)m->done.size() < m->spec.count) return fail("not all frames captured yet");
+    if (m->spec.kind == "roto") {
+        if ((int)m->done.size() < m->spec.count) return fail("play the whole clip once first");
+        bool ok = startRotoTrackLocked(c, id, dir, m->spec.count, err);
+        m->haveStatus = false;
+        return ok;
+    }
 
     // Longest unbroken run of captured frames (the whole clip when everything is there).
     int bestFirst = 0, bestN = 0, runFirst = 0, runN = 0, prev = -2;
@@ -365,7 +378,8 @@ bool launchJob(const std::string& c, const std::string& id, bool partialOk, std:
     std::string runSrc = joinPath(dir, "run/src"), runHint = joinPath(dir, "run/hint");
     makeDirs(runSrc);
     bool useHint = m->spec.hint;
-    for (int i = 0; i < bestN && useHint; ++i)
+    const int hintNeeded = m->spec.hintFirstOnly ? 1 : bestN;
+    for (int i = 0; i < hintNeeded && useHint; ++i)
         useHint = fileExists(joinPath(joinPath(dir, "hint"), numbered("hint", bestFirst + i)));
     if (useHint) makeDirs(runHint);
     for (int i = 0; i < bestN; ++i) {
@@ -377,7 +391,7 @@ bool launchJob(const std::string& c, const std::string& id, bool partialOk, std:
             m->haveStatus = false;
             return fail("couldn't prepare the captured frames");
         }
-        if (useHint)
+        if (useHint && i < hintNeeded)
             fs::rename(joinPath(joinPath(dir, "hint"), numbered("hint", bestFirst + i)),
                        joinPath(runHint, numbered("hint", i)), ec);
     }
@@ -407,7 +421,11 @@ bool launchJob(const std::string& c, const std::string& id, bool partialOk, std:
     if (s.linear) argv.push_back("--frame_dir_linear");
     if (useHint) {
         std::snprintf(num, sizeof(num), "%.3f", s.hintQ);
-        argv.insert(argv.end(), {"--hint_video", runHint, "--hint_quality", num});
+        if (s.hintFirstOnly)
+            argv.insert(argv.end(), {"--hint_first_frame", joinPath(runHint, numbered("hint", 0)),
+                                     "--hint_quality", num, "--carry_hint_quality", num});
+        else
+            argv.insert(argv.end(), {"--hint_video", runHint, "--hint_quality", num});
     }
     if (s.window > 0 && s.window < 6) {
         int ch = std::atoi(kWindowSizes[s.window]);
@@ -423,7 +441,7 @@ bool launchJob(const std::string& c, const std::string& id, bool partialOk, std:
     {
         std::ofstream log(joinPath(dir, "engine.log"), std::ios::app);
         log << "[plugin] keying frames " << (s.start + bestFirst) << ".." << (s.start + bestFirst + bestN - 1)
-            << (useHint ? " with hint" : "") << "\n[plugin]";
+            << (useHint ? (s.hintFirstOnly ? " with first-frame hint" : " with hint") : "") << "\n[plugin]";
         for (size_t i = 5; i < argv.size(); ++i) log << " " << argv[i];
         log << "\n";
     }
@@ -511,13 +529,15 @@ JobStatus jobStatus(const std::string& c, const std::string& id, bool fresh) {
     }
     if (readText(joinPath(dir, "exitcode"), code)) {
         while (!code.empty() && (code.back() == '\n' || code.back() == '\r')) code.pop_back();
-        if (code == "0" && fileExists(outFramePath(c, id, "cutout", 0))) {
+        bool produced = m->spec.kind == "roto" ? fileExists(trackMaskPath(c, id, 0))
+                                               : fileExists(outFramePath(c, id, "cutout", 0));
+        if (code == "0" && produced) {
             st.state = JobState::Done;
         } else if (code == "cancelled") {
             st.state = JobState::Cancelled;
         } else {
             st.state = JobState::Failed;
-            st.message = code == "0" ? "the engine finished but wrote no frames"
+            st.message = code == "0" ? "finished without writing any frames"
                                      : lastUsefulLine(tailOf(st.logPath));
             if (st.message.empty()) st.message = "engine exit code " + code;
         }
@@ -525,6 +545,8 @@ JobStatus jobStatus(const std::string& c, const std::string& id, bool fresh) {
         st.state = JobState::Keying;
         st.cancelling = fileExists(joinPath(dir, "cancel"));
         std::string t = tailOf(st.logPath);
+        size_t mark = t.rfind("[plugin]");  // only this run's progress (a re-track appends)
+        if (mark != std::string::npos) t = t.substr(mark);
         static const std::regex re("window (\\d+)/(\\d+)");
         double p = 0.0;
         for (std::sregex_iterator it(t.begin(), t.end(), re), end; it != end; ++it) {
@@ -541,6 +563,226 @@ JobStatus jobStatus(const std::string& c, const std::string& id, bool fresh) {
     m->haveStatus = true;
     m->statusAt = now;
     return st;
+}
+
+// ------------------------------------------------------------------ roto
+
+std::string rotoRoot(const std::string& c) { return joinPath(c, "roto"); }
+// Roto jobs use rotoRoot(cache) as their "cache" for the shared job functions.
+std::string previewMaskPath(const std::string& c, const std::string& id, int idx) {
+    return joinPath(joinPath(joinPath(c, id), "preview"), numbered("mask", idx));
+}
+std::string trackMaskPath(const std::string& c, const std::string& id, int idx) {
+    return joinPath(joinPath(joinPath(c, id), "masks"), numbered("mask", idx));
+}
+
+static long long nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static double fileAgeSeconds(const std::string& p) {
+    std::error_code ec;
+    auto t = fs::last_write_time(p, ec);
+    if (ec) return 1e9;
+    auto now = decltype(t)::clock::now();
+    return std::chrono::duration<double>(now - t).count();
+}
+
+bool ensureRotoDaemon(const std::string& root, std::string* err) {
+    // root = rotoRoot(cache). Alive if its heartbeat is fresh.
+    if (fileAgeSeconds(joinPath(root, "daemon.alive")) < 10) return true;
+    // Just started one? (loading torch takes a while before the first heartbeat)
+    if (fileAgeSeconds(joinPath(root, "daemon.starting")) < 60) return true;
+    EngineConfig cfg = loadConfig();
+    if (!cfg.ok) {
+        if (err) *err = cfg.error;
+        return false;
+    }
+    if (!fileExists(cfg.rotoScript)) {
+        if (err) *err = "roto_daemon.py not found next to " + cfg.path + " (run install.sh again)";
+        return false;
+    }
+    makeDirs(root);
+    writeTextAtomic(joinPath(root, "daemon.starting"), std::to_string(nowMs()));
+    std::vector<std::string> argv = {cfg.python, cfg.rotoScript, root, cfg.samModel};
+    std::map<std::string, std::string> env = {{"PYTHONUNBUFFERED", "1"}, {"PYTORCH_ENABLE_MPS_FALLBACK", "1"},
+                                              {"PATH", enginePath(cfg)}};
+    return spawnDetached(argv, env, root, err);
+}
+
+std::string previewDir(const std::string& root, const std::string& id) {
+    return joinPath(joinPath(root, id), "preview");
+}
+
+bool pickerOpen(const std::string& root, const std::string& id) {
+    return fileAgeSeconds(joinPath(joinPath(root, id), "picker.open")) < 6;
+}
+
+bool openPicker(const std::string& root, const std::string& id, int idx, const std::string& model,
+                std::string* err) {
+    if (pickerOpen(root, id)) return true;  // already open (it stays on top)
+    EngineConfig cfg = loadConfig();
+    if (!cfg.ok) {
+        if (err) *err = cfg.error;
+        return false;
+    }
+    if (!fileExists(cfg.pickerScript)) {
+        if (err) *err = "roto_picker.py not found next to " + cfg.path + " (run install.sh again)";
+        return false;
+    }
+    if (!ensureRotoDaemon(root, err)) return false;  // start loading SAM 2 right away
+    std::string dir = joinPath(root, id);
+    writeTextAtomic(joinPath(dir, "picker.open"), "starting");
+    std::vector<std::string> argv = {cfg.python, cfg.pickerScript, dir, std::to_string(idx), cfg.rotoScript, model};
+    // Resolve's own library/Qt settings must not leak into the picker's Qt.
+    std::map<std::string, std::string> env = {
+        {"PATH", enginePath(cfg)},       {"LD_LIBRARY_PATH", kEnvUnset},   {"QT_PLUGIN_PATH", kEnvUnset},
+        {"QML2_IMPORT_PATH", kEnvUnset}, {"QT_QPA_PLATFORM_PLUGIN_PATH", kEnvUnset},
+        {"PYTHONPATH", kEnvUnset},       {"PYTHONHOME", kEnvUnset},        {"DYLD_LIBRARY_PATH", kEnvUnset},
+        {"DYLD_FRAMEWORK_PATH", kEnvUnset}};
+    return spawnDetached(argv, env, dir, err);
+}
+
+Prompts readPrompts(const std::string& root, const std::string& id) {
+    Prompts p;
+    std::string s;
+    if (!readText(joinPath(joinPath(root, id), "prompts.json"), s)) return p;
+    static const std::regex fr("\"frame\"\\s*:\\s*(-?\\d+)");
+    std::smatch m;
+    if (!std::regex_search(s, m, fr)) return p;
+    p.frame = std::stoi(m[1]);
+    size_t pos = 0;  // one "points" key per object
+    while ((pos = s.find("\"points\"", pos)) != std::string::npos) {
+        ++p.objects;
+        ++pos;
+    }
+    p.valid = p.objects > 0;
+    return p;
+}
+
+static long long jsonSeq(const std::string& s) {
+    static const std::regex re("\"seq\"\\s*:\\s*(\\d+)");
+    std::smatch m;
+    return std::regex_search(s, m, re) ? std::stoll(m[1]) : 0;
+}
+
+PreviewState previewState(const std::string& root, const std::string& id) {
+    PreviewState p;
+    std::string pv = previewDir(root, id), req, done;
+    if (!readText(joinPath(pv, "request.json"), req)) return p;
+    readText(joinPath(pv, "done.json"), done);
+    p.pending = jsonSeq(req) > jsonSeq(done);
+    static const std::regex re("\"error\"\\s*:\\s*\"([^\"]*)\"");
+    std::smatch m;
+    if (!p.pending && std::regex_search(done, m, re)) p.error = m[1];
+    return p;
+}
+
+bool trackWanted(const std::string& root, const std::string& id) {
+    return fileExists(joinPath(joinPath(root, id), "want_track"));
+}
+
+// Called with the job's lock held, frames complete (or kept from an earlier track).
+bool startRotoTrackLocked(const std::string& root, const std::string& id, const std::string& dir, int count,
+                          std::string* err) {
+    std::string prompt;
+    if (!readText(joinPath(dir, "prompts.json"), prompt)) {
+        if (err) *err = "press 'Pick character…' first";
+        return false;
+    }
+    std::error_code ec;
+    fs::remove(joinPath(dir, "exitcode"), ec);
+    fs::remove(joinPath(dir, "cancel"), ec);
+    fs::remove_all(joinPath(dir, "masks"), ec);
+    // prompts.json is {"frame": f, "objects": [...], "model": "..."}; add seq + count.
+    std::string body = prompt.substr(prompt.find('{') + 1);
+    std::ostringstream o;
+    o << "{\"seq\": " << nowMs() << ", \"kind\": \"track\", \"count\": " << count << ", " << body;
+    writeTextAtomic(joinPath(dir, "launched"), "0 " + std::to_string(count) + "\n");
+    std::ofstream(joinPath(dir, "engine.log"), std::ios::app) << "[plugin] tracking requested\n";
+    if (!writeTextAtomic(joinPath(dir, "request.json"), o.str())) {
+        if (err) *err = "can't write the track request";
+        return false;
+    }
+    fs::remove(joinPath(dir, "want_track"), ec);
+    return ensureRotoDaemon(root, err);
+}
+
+bool requestTrack(const std::string& root, const std::string& id, std::string* err) {
+    std::string dir = joinPath(root, id);
+    auto m = jobMem(root, id);
+    std::lock_guard<std::mutex> lock(m->mu);
+    loadLocked(*m, dir);
+    if (!m->loaded) {
+        if (err) *err = "roto job missing";
+        return false;
+    }
+    if (!fileExists(joinPath(dir, "prompts.json"))) {
+        if (err) *err = "press 'Pick character…' first";
+        return false;
+    }
+    if (fileExists(joinPath(dir, "launched")) && !fileExists(joinPath(dir, "exitcode"))) {
+        if (err) *err = "already tracking; press Stop first";
+        return false;
+    }
+    m->haveStatus = false;
+    // Frames already prepared by an earlier track: go straight away.
+    bool ready = fileExists(joinPath(joinPath(dir, "sam"), "info.json")) || (int)m->done.size() >= m->spec.count;
+    if (ready) return startRotoTrackLocked(root, id, dir, m->spec.count, err);
+    std::error_code ec;
+    fs::remove(joinPath(dir, "exitcode"), ec);
+    fs::remove(joinPath(dir, "launched"), ec);
+    writeTextAtomic(joinPath(dir, "want_track"), "1");
+    return true;
+}
+
+// ------------------------------------------------------------------ key names
+
+std::string safeKeyName(const std::string& name) {
+    std::string out;
+    for (unsigned char c : name) {
+        if (std::isalnum(c)) out += (char)std::tolower(c);
+        else if (c == '-' || c == '_') out += (char)c;
+        else if (c == ' ' || c == '.') out += '_';
+    }
+    while (!out.empty() && out.back() == '_') out.pop_back();
+    return out.substr(0, 64);
+}
+
+bool registerKeyName(const std::string& c, const std::string& name, const std::string& id, int start, int count,
+                     bool linear) {
+    std::string n = safeKeyName(name);
+    if (n.empty() || id.empty()) return false;
+    makeDirs(joinPath(c, "names"));
+    std::ostringstream o;
+    o << id << " " << start << " " << count << " " << (linear ? 1 : 0) << "\n";
+    return writeTextAtomic(joinPath(joinPath(c, "names"), n + ".key"), o.str());
+}
+
+KeyRef lookupKeyName(const std::string& c, const std::string& name) {
+    struct Entry {
+        KeyRef ref;
+        std::chrono::steady_clock::time_point at;
+    };
+    static std::mutex* mu = new std::mutex;
+    static auto* cache = new std::map<std::string, Entry>;
+    std::string n = safeKeyName(name);
+    if (n.empty()) return {};
+    auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(*mu);
+    auto it = cache->find(c + "|" + n);
+    if (it != cache->end() && now - it->second.at < std::chrono::milliseconds(500)) return it->second.ref;
+    KeyRef r;
+    std::string s;
+    if (readText(joinPath(joinPath(c, "names"), n + ".key"), s)) {
+        std::istringstream in(s);
+        int lin = 0;
+        if (in >> r.id >> r.start >> r.count >> lin) r.linear = lin == 1;
+        else r = KeyRef{};
+    }
+    (*cache)[c + "|" + n] = {r, now};
+    return r;
 }
 
 }  // namespace ck

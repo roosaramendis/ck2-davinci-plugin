@@ -42,13 +42,15 @@ else:
         if not cancelled and (os.path.exists(os.path.join(job, "cancel")) or not os.path.isdir(job)):
             cancelled = True
             log.write(b"\n[plugin] cancel requested\n")
-            try:
-                if os.name == "nt":
-                    p.send_signal(signal.CTRL_BREAK_EVENT)
-                else:
+            if os.name == "nt":
+                # No console to send Ctrl+Break to: end the engine and its children (ffmpeg).
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True,
+                               creationflags=0x08000000)
+            else:
+                try:
                     os.killpg(p.pid, signal.SIGINT)
-            except Exception:
-                pass
+                except Exception:
+                    pass
             t = time.time()
             while p.poll() is None and time.time() - t < 10:
                 time.sleep(0.2)
@@ -63,12 +65,14 @@ else:
         time.sleep(0.5)
     code = "cancelled" if cancelled else str(p.wait())
 shutil.rmtree(os.path.join(job, "run"), ignore_errors=True)
-try:
-    with open(os.path.join(job, "exitcode.tmp"), "w") as f:
-        f.write(code)
-    os.replace(os.path.join(job, "exitcode.tmp"), os.path.join(job, "exitcode"))
-except OSError:
-    pass
+for _ in range(50):  # Windows: the plugin may be reading it right now
+    try:
+        with open(os.path.join(job, "exitcode.tmp"), "w") as f:
+            f.write(code)
+        os.replace(os.path.join(job, "exitcode.tmp"), os.path.join(job, "exitcode"))
+        break
+    except OSError:
+        time.sleep(0.1)
 )PY";
 
 static const char* kWindowSizes[] = {"", "80", "48", "24", "8", "1"};
@@ -136,7 +140,11 @@ struct JobMem {
     bool haveStatus = false;
     JobStatus status;
     std::chrono::steady_clock::time_point statusAt;
+    int lastSeen = -1;        // last frame the host rendered while capturing
+    bool autoStart = false;   // playback looped: start once the queued frames are written
 };
+
+static void startCaptured(const std::string& c, const std::string& id);
 
 struct JobTable {
     std::mutex mu;
@@ -245,7 +253,7 @@ static void writerLoop() {
         ok = ok && !ec;
 
         auto m = jobMem(t.cache, t.id);
-        bool complete = false;
+        bool complete = false, looped = false;
         {
             std::lock_guard<std::mutex> lock(m->mu);
             m->inflight.erase(t.idx);
@@ -253,8 +261,13 @@ static void writerLoop() {
             m->haveStatus = false;
             complete = ok && m->spec.count > 0 && (int)m->done.size() >= m->spec.count &&
                        (m->spec.kind != "roto" || fileExists(joinPath(dir, "want_track")));
+            if (m->autoStart && m->inflight.empty() && !complete) {
+                m->autoStart = false;
+                looped = true;
+            }
         }
         if (complete) launchJob(t.cache, t.id, false, nullptr);
+        else if (looped) startCaptured(t.cache, t.id);
         {
             std::lock_guard<std::mutex> lock(q.mu);
             --q.busy;
@@ -327,10 +340,58 @@ bool captureFrame(const std::string& c, const std::string& id, int idx, std::vec
     return true;
 }
 
+// ------------------------------------------------------------------ playback loop detection
+
+static const int kMinLoopRun = 8;
+
+// Start a job on the frames captured so far (playback looped / button).
+static void startCaptured(const std::string& c, const std::string& id) {
+    std::string err;
+    auto m = jobMem(c, id);
+    std::string kind;
+    {
+        std::lock_guard<std::mutex> lock(m->mu);
+        kind = m->spec.kind;
+    }
+    bool ok = kind == "roto" ? requestTrack(c, id, &err) == TrackStart::Started : launchJob(c, id, true, &err);
+    if (!ok)
+        std::ofstream(joinPath(joinPath(c, id), "engine.log"), std::ios::app)
+            << "[plugin] couldn't start after the playback loop: " << err << "\n";
+}
+
+bool notePlayback(const std::string& c, const std::string& id, int idx) {
+    std::string dir = jobDir(c, id);
+    auto m = jobMem(c, id);
+    bool startNow = false;
+    {
+        std::lock_guard<std::mutex> lock(m->mu);
+        loadLocked(*m, dir);
+        int prev = m->lastSeen;
+        m->lastSeen = idx;
+        if (!m->loaded || prev < 0 || idx >= prev - 1) return false;  // not a jump back
+        if (m->spec.kind == "roto" && !fileExists(joinPath(dir, "want_track"))) return false;
+        if (fileExists(joinPath(dir, "launched")) || fileExists(joinPath(dir, "exitcode"))) return false;
+        auto have = [&](int i) { return m->done.count(i) || m->inflight.count(i); };
+        if (!have(prev) || !have(idx)) return false;
+        int a = prev;
+        while (have(a - 1)) --a;
+        // Jumped from the end of an unbroken run back to its first frame = playback looped.
+        if (idx != a || have(prev + 1) || prev - a + 1 < kMinLoopRun) return false;
+        std::ofstream(joinPath(dir, "engine.log"), std::ios::app)
+            << "[plugin] playback looped back to frame " << a << " after frame " << prev
+            << ": starting with the " << (prev - a + 1) << " captured frames\n";
+        if (m->inflight.empty()) startNow = true;
+        else m->autoStart = true;  // the last frames are still being written
+        m->haveStatus = false;
+    }
+    if (startNow) startCaptured(c, id);
+    return true;
+}
+
 // ------------------------------------------------------------------ launch
 
-bool startRotoTrackLocked(const std::string& root, const std::string& id, const std::string& dir, int count,
-                          std::string* err);
+bool startRotoTrackLocked(const std::string& root, const std::string& id, const std::string& dir, int first,
+                          int count, std::string* err);
 
 static void failJob(const std::string& dir, const std::string& msg) {
     std::ofstream(joinPath(dir, "engine.log"), std::ios::app) << "[plugin] " << msg << "\n";
@@ -352,7 +413,7 @@ bool launchJob(const std::string& c, const std::string& id, bool partialOk, std:
     if (!partialOk && (int)m->done.size() < m->spec.count) return fail("not all frames captured yet");
     if (m->spec.kind == "roto") {
         if ((int)m->done.size() < m->spec.count) return fail("play the whole clip once first");
-        bool ok = startRotoTrackLocked(c, id, dir, m->spec.count, err);
+        bool ok = startRotoTrackLocked(c, id, dir, 0, m->spec.count, err);
         m->haveStatus = false;
         return ok;
     }
@@ -434,7 +495,8 @@ bool launchJob(const std::string& c, const std::string& id, bool partialOk, std:
         if (s.lowVram) argv.push_back("--low_vram");
     }
     std::map<std::string, std::string> env = {
-        {"TMPDIR", cfg.tempDir}, {"PYTHONUNBUFFERED", "1"}, {"HF_HUB_OFFLINE", "1"},
+        {"TMPDIR", cfg.tempDir}, {"TEMP", cfg.tempDir}, {"TMP", cfg.tempDir}, {"PYTHONUNBUFFERED", "1"},
+        {"HF_HUB_OFFLINE", "1"},
         {"TRANSFORMERS_OFFLINE", "1"}, {"PYTORCH_ENABLE_MPS_FALLBACK", "1"},
         {"PATH", enginePath(cfg)}};
 
@@ -529,7 +591,7 @@ JobStatus jobStatus(const std::string& c, const std::string& id, bool fresh) {
     }
     if (readText(joinPath(dir, "exitcode"), code)) {
         while (!code.empty() && (code.back() == '\n' || code.back() == '\r')) code.pop_back();
-        bool produced = m->spec.kind == "roto" ? fileExists(trackMaskPath(c, id, 0))
+        bool produced = m->spec.kind == "roto" ? fileExists(trackMaskPath(c, id, st.keyedFirst))
                                                : fileExists(outFramePath(c, id, "cutout", 0));
         if (code == "0" && produced) {
             st.state = JobState::Done;
@@ -684,8 +746,8 @@ bool trackWanted(const std::string& root, const std::string& id) {
 }
 
 // Called with the job's lock held, frames complete (or kept from an earlier track).
-bool startRotoTrackLocked(const std::string& root, const std::string& id, const std::string& dir, int count,
-                          std::string* err) {
+bool startRotoTrackLocked(const std::string& root, const std::string& id, const std::string& dir, int first,
+                          int count, std::string* err) {
     std::string prompt;
     if (!readText(joinPath(dir, "prompts.json"), prompt)) {
         if (err) *err = "press 'Pick character…' first";
@@ -698,9 +760,11 @@ bool startRotoTrackLocked(const std::string& root, const std::string& id, const 
     // prompts.json is {"frame": f, "objects": [...], "model": "..."}; add seq + count.
     std::string body = prompt.substr(prompt.find('{') + 1);
     std::ostringstream o;
-    o << "{\"seq\": " << nowMs() << ", \"kind\": \"track\", \"count\": " << count << ", " << body;
-    writeTextAtomic(joinPath(dir, "launched"), "0 " + std::to_string(count) + "\n");
-    std::ofstream(joinPath(dir, "engine.log"), std::ios::app) << "[plugin] tracking requested\n";
+    o << "{\"seq\": " << nowMs() << ", \"kind\": \"track\", \"first\": " << first << ", \"count\": " << count
+      << ", " << body;
+    writeTextAtomic(joinPath(dir, "launched"), std::to_string(first) + " " + std::to_string(count) + "\n");
+    std::ofstream(joinPath(dir, "engine.log"), std::ios::app)
+        << "[plugin] tracking requested for frames " << first << "-" << (first + count - 1) << "\n";
     if (!writeTextAtomic(joinPath(dir, "request.json"), o.str())) {
         if (err) *err = "can't write the track request";
         return false;
@@ -709,32 +773,57 @@ bool startRotoTrackLocked(const std::string& root, const std::string& id, const 
     return ensureRotoDaemon(root, err);
 }
 
-bool requestTrack(const std::string& root, const std::string& id, std::string* err) {
+bool rotoDaemonAlive(const std::string& root) {
+    return fileAgeSeconds(joinPath(root, "daemon.alive")) < 10 || fileAgeSeconds(joinPath(root, "daemon.starting")) < 60;
+}
+
+TrackStart requestTrack(const std::string& root, const std::string& id, std::string* err) {
     std::string dir = joinPath(root, id);
     auto m = jobMem(root, id);
     std::lock_guard<std::mutex> lock(m->mu);
     loadLocked(*m, dir);
-    if (!m->loaded) {
-        if (err) *err = "roto job missing";
-        return false;
-    }
-    if (!fileExists(joinPath(dir, "prompts.json"))) {
-        if (err) *err = "press 'Pick character…' first";
-        return false;
-    }
+    auto fail = [&](const std::string& msg) {
+        if (err) *err = msg;
+        return TrackStart::Failed;
+    };
+    if (!m->loaded) return fail("roto job missing");
+    std::string prompt;
+    if (!readText(joinPath(dir, "prompts.json"), prompt)) return fail("press 'Pick character…' first");
+    std::error_code ec;
     if (fileExists(joinPath(dir, "launched")) && !fileExists(joinPath(dir, "exitcode"))) {
-        if (err) *err = "already tracking; press Stop first";
-        return false;
+        if (rotoDaemonAlive(root)) return fail("already tracking; press Stop first");
+        fs::remove(joinPath(dir, "launched"), ec);  // the helper died: start over
     }
     m->haveStatus = false;
-    // Frames already prepared by an earlier track: go straight away.
-    bool ready = fileExists(joinPath(joinPath(dir, "sam"), "info.json")) || (int)m->done.size() >= m->spec.count;
-    if (ready) return startRotoTrackLocked(root, id, dir, m->spec.count, err);
-    std::error_code ec;
+    // Frames already prepared by an earlier track: go straight away with the same range.
+    std::string info;
+    if (readText(joinPath(joinPath(dir, "sam"), "info.json"), info)) {
+        static const std::regex fr("\"first\"\\s*:\\s*(\\d+)"), nr("\"n\"\\s*:\\s*(\\d+)");
+        std::smatch a, b;
+        int first = std::regex_search(info, a, fr) ? std::stoi(a[1]) : 0;
+        int n = std::regex_search(info, b, nr) ? std::stoi(b[1]) : m->spec.count;
+        return startRotoTrackLocked(root, id, dir, first, n, err) ? TrackStart::Started : TrackStart::Failed;
+    }
+    if ((int)m->done.size() >= m->spec.count)
+        return startRotoTrackLocked(root, id, dir, 0, m->spec.count, err) ? TrackStart::Started : TrackStart::Failed;
+
+    // Pressed again while capturing: track the captured part around the picked frame now.
+    if (fileExists(joinPath(dir, "want_track")) && !m->done.empty()) {
+        static const std::regex fr("\"frame\"\\s*:\\s*(-?\\d+)");
+        std::smatch mm;
+        int pf = std::regex_search(prompt, mm, fr) ? std::stoi(mm[1]) : 0;
+        if (!m->done.count(pf))
+            return fail("frame " + std::to_string(pf) + " (where you picked) wasn't captured yet: play over it");
+        int a = pf, b = pf;
+        while (m->done.count(a - 1)) --a;
+        while (m->done.count(b + 1)) ++b;
+        if (b - a + 1 < 2) return fail("only one frame around frame " + std::to_string(pf) + " was captured: play more");
+        return startRotoTrackLocked(root, id, dir, a, b - a + 1, err) ? TrackStart::Started : TrackStart::Failed;
+    }
     fs::remove(joinPath(dir, "exitcode"), ec);
     fs::remove(joinPath(dir, "launched"), ec);
     writeTextAtomic(joinPath(dir, "want_track"), "1");
-    return true;
+    return TrackStart::WaitingForFrames;
 }
 
 // ------------------------------------------------------------------ key names

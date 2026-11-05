@@ -17,6 +17,8 @@ namespace fs = std::filesystem;
 #define kRPick "pickCharacter"
 #define kRTrack "trackClip"
 #define kRStop "stopTrack"
+#define kRTrackNow "trackNow"
+#define kRReport "reportBug"
 #define kRRefresh "refreshStatus"
 #define kRForget "forgetRoto"
 #define kRStatus "status"
@@ -400,7 +402,9 @@ bool CorridorKeyRoto::ensureJob(RotoData& r, std::string* err) {
                         "to the Roto node's yellow input; the same clip also stays connected to CorridorKey)";
         return false;
     }
-    OfxRangeD range = src_->getFrameRange();
+    std::string how;
+    OfxRangeD range = playableRange(this, src_, dst_, &how);
+    plog("roto: frame range " + how);
     int t0 = (int)std::ceil(range.min - 1e-5), t1 = (int)std::floor(range.max + 1e-5);
     ck::JobSpec spec;
     spec.kind = "roto";
@@ -486,11 +490,13 @@ void CorridorKeyRoto::track() {
                                                : "✗ Press 'Pick character…' and choose what to keep first.");
         return;
     }
-    if (!ck::requestTrack(root(), r.id, &err)) {
+    ck::TrackStart ts = ck::requestTrack(root(), r.id, &err);
+    if (ts == ck::TrackStart::Failed) {
         setStatus("✗ " + err);
         return;
     }
-    plog("roto track requested: " + std::to_string(pr.objects) + " object(s) from frame " + std::to_string(pr.frame));
+    plog(std::string("roto track ") + (ts == ck::TrackStart::Started ? "started" : "waiting for playback") + ": " +
+         std::to_string(pr.objects) + " object(s) picked on frame " + std::to_string(pr.frame));
     refresh();
 }
 
@@ -507,7 +513,8 @@ void CorridorKeyRoto::refresh() {
     switch (st.state) {
     case ck::JobState::Capturing:
         if (ck::trackWanted(root(), r.id))
-            o << "Capturing frames " << st.captured << "/" << st.count << ": play the clip once; tracking starts by itself.";
+            o << "Captured " << st.captured << "/" << st.count << " frames: play the clip to the end (tracking starts "
+              << "by itself, also when playback loops back), or press 'Track captured frames now'.";
         else if (ck::pickerOpen(root(), r.id))
             o << "Picker window is open: choose what to keep, then 'Use this selection'.";
         else if (pr.valid)
@@ -516,9 +523,19 @@ void CorridorKeyRoto::refresh() {
             o << "Press 'Pick character…' and choose what to keep.";
         break;
     case ck::JobState::Keying:
-        o << (st.cancelling ? "Stopping…" : "Tracking in the background: ") << (int)std::lround(st.progress * 100) << "%";
+        if (!ck::rotoDaemonAlive(root()))
+            o << "✗ The SAM 2 helper isn't running. Press 'Track clip' to start it again (details: "
+              << ck::joinPath(root(), "daemon.log") << ").";
+        else if (st.cancelling)
+            o << "Stopping…";
+        else
+            o << "Tracking frames " << st.keyedFirst << "-" << (st.keyedFirst + st.keyedCount - 1)
+              << " in the background: " << (int)std::lround(st.progress * 100) << "%";
         break;
-    case ck::JobState::Done: o << "✓ Tracked " << st.keyedCount << " frames. Output: pick Hint matte or Garbage-filled."; break;
+    case ck::JobState::Done:
+        o << "✓ Tracked frames " << st.keyedFirst << "-" << (st.keyedFirst + st.keyedCount - 1)
+          << ". Now press Key clip on the CorridorKey node.";
+        break;
     case ck::JobState::Failed: o << "✗ Tracking failed: " << st.message; break;
     case ck::JobState::Cancelled: o << "Stopped. Press 'Track clip' to try again."; break;
     default: o << "Go to a frame where the character is clear and press 'Pick character…'."; break;
@@ -528,16 +545,38 @@ void CorridorKeyRoto::refresh() {
 }
 
 void CorridorKeyRoto::changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) {
-    bool button = name == kRPick || name == kRTrack || name == kRStop || name == kRRefresh || name == kRForget;
+    if (name == kRReport) {
+        std::string st;
+        try { status_->getValue(st); } catch (...) {}
+        reportBug(detectHost().text, "CorridorKey Roto", st);
+        return;
+    }
+    bool button = name == kRPick || name == kRTrack || name == kRTrackNow || name == kRStop || name == kRRefresh || name == kRForget;
     if (!button) return;
     if (name != kRRefresh) plog("roto button '" + name + "'");
     try {
         if (name == kRPick) pick(args.time);
         else if (name == kRTrack) track();
+        else if (name == kRTrackNow) {
+            RotoData r = data();
+            if (r.valid() && !ck::trackWanted(root(), r.id)) track();  // not waiting yet: ask first
+            if (r.valid() && ck::jobStatus(root(), r.id, true).state == ck::JobState::Capturing) {
+                ck::waitForWrites();
+                track();  // while capturing, this tracks the captured part around the picked frame
+            }
+        }
         else if (name == kRRefresh) refresh();
         else if (name == kRStop) {
             RotoData r = data();
-            if (r.valid()) ck::cancelJob(root(), r.id);
+            if (r.valid()) {
+                ck::cancelJob(root(), r.id);
+                // The helper isn't running (crashed / closed): nothing will confirm the stop.
+                std::string dir = ck::joinPath(root(), r.id);
+                if (!ck::rotoDaemonAlive(root()) && !ck::fileExists(ck::joinPath(dir, "exitcode")))
+                    ck::writeTextAtomic(ck::joinPath(dir, "exitcode"), "cancelled");
+                std::error_code ec;
+                fs::remove(ck::joinPath(dir, "want_track"), ec);
+            }
             refresh();
         } else if (name == kRForget) {
             RotoData r = data();
@@ -569,11 +608,15 @@ void CorridorKeyRoto::render(const OFX::RenderArguments& args) {
 
     // Capture frames while the user plays the clip (after Track clip was pressed).
     if (r.valid() && st.state == ck::JobState::Capturing && ck::trackWanted(rr, r.id) && src && fullRes &&
-        idx >= 0 && idx < r.count && !ck::frameCaptured(rr, r.id, idx)) {
-        std::vector<float> rgb, none;
-        int w = 0, h = 0;
-        OfxRectI b;
-        if (imageToBuffer(src.get(), 3, rgb, w, h, b)) ck::captureFrame(rr, r.id, idx, std::move(rgb), w, h, b.x1, b.y1, std::move(none));
+        idx >= 0 && idx < r.count) {
+        if (!ck::frameCaptured(rr, r.id, idx)) {
+            std::vector<float> rgb, none;
+            int w = 0, h = 0;
+            OfxRectI b;
+            if (imageToBuffer(src.get(), 3, rgb, w, h, b))
+                ck::captureFrame(rr, r.id, idx, std::move(rgb), w, h, b.x1, b.y1, std::move(none));
+        }
+        if (ck::notePlayback(rr, r.id, idx)) plog("roto " + r.id + ": playback looped, tracking the captured frames");
     }
 
     // Which mask applies to this frame?
@@ -592,7 +635,8 @@ void CorridorKeyRoto::render(const OFX::RenderArguments& args) {
     } else if (st.state == ck::JobState::Capturing && ck::trackWanted(rr, r.id)) {
         if (!fullRes) bn = {"ROTO: SET PLAYBACK TO FULL RESOLUTION TO CAPTURE", 1.0f, 0.75f, 0.1f};
         else {
-            std::snprintf(line, sizeof(line), "ROTO: CAPTURING %d/%d - PLAY THE CLIP ONCE", std::min(st.captured + 1, st.count), st.count);
+            std::snprintf(line, sizeof(line), "ROTO: CAPTURING %d/%d - PLAY THE CLIP",
+                          std::min(st.captured + 1, st.count), st.count);
             bn = {line, 1.0f, 0.8f, 0.1f, st.count ? (double)st.captured / st.count : 0.0};
         }
     } else if (st.state == ck::JobState::Keying) {
@@ -741,6 +785,8 @@ void CorridorKeyRotoFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     button(kRPick, "Pick character…", "Opens a window on this frame: click on what to keep, right-click on what "
                                       "to remove, drag rectangles around characters. Live preview.");
     button(kRTrack, "Track clip", "Track the picked selection through the whole clip. Play the clip once to capture it.");
+    button(kRTrackNow, "Track captured frames now",
+           "Don't wait for the whole clip: track the frames captured so far around the picked frame.");
     button(kRStop, "Stop", "Stop tracking.");
     button(kRRefresh, "Update status", "Refresh the status line and the viewer.");
 
@@ -820,6 +866,7 @@ void CorridorKeyRotoFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     page->addChild(*ic);
 
     button(kRForget, "Forget roto", "Delete this node's tracking data from disk.");
+    button(kRReport, "Report a bug", "Opens a GitHub issue with the latest log lines filled in, and the log folder.");
 
     OFX::StringParamDescriptor* data = desc.defineStringParam(kRData);
     data->setLabel("Roto data");

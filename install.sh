@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# CorridorKey 2.0 – DaVinci Resolve plugin installer (Linux + macOS).
+# CorridorKey 2.0 – DaVinci Resolve plugin installer (Linux, any distro + macOS).
+# Windows: install.ps1. Usually run for you by the ck2-gui app (Setup → DCC plugins).
 #
-#   bash install.sh                      build, install, connect to the engine
+#   bash install.sh                      install (ready-made build if present, else compile)
 #   bash install.sh --engine DIR         use this CorridorKey2.0 engine folder
-#   bash install.sh --prebuilt           Linux: skip compiling, use prebuilt/ zip
+#   bash install.sh --build              compile even if a ready-made build is present
+#   bash install.sh --ffmpeg PATH        ffmpeg for the engine (default: the one on PATH)
+#   bash install.sh --gui                ask for the password with a dialog (no terminal)
 #   bash install.sh --connect-only       only (re)write the config (engine moved)
 #   bash install.sh --no-sam             skip downloading the SAM 2 model (Roto node)
 #   bash install.sh --uninstall          remove the plugin from Resolve's OFX folder
@@ -11,10 +14,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUNDLE="CorridorKey2.ofx.bundle"
-SUDO="${SUDO-sudo}"
+SUDO="${SUDO-sudo}"   # SUDO= (empty) runs admin steps directly (tests, root)
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
     OS=mac
+    PREBUILT_ZIP="$HERE/prebuilt/CorridorKey2-ofx-macos.zip"
     OFX_DIR="${OFX_DIR:-/Library/OFX/Plugins}"
     CONF_DIR="${CONF_DIR:-$HOME/Library/Application Support/ck2-davinci-plugin}"
     CACHE_DIR="$HOME/Library/Caches/corridorkey-ofx"
@@ -25,6 +29,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 else
     OS=linux
+    PREBUILT_ZIP="$HERE/prebuilt/CorridorKey2-ofx-linux.zip"
     OFX_DIR="${OFX_DIR:-/usr/OFX/Plugins}"
     CONF_DIR="${CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ck2-davinci-plugin}"
     CACHE_DIR="$HOME/.cache/corridorkey-ofx"   # not /tmp: RAM-backed on CachyOS
@@ -39,15 +44,35 @@ say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m ✓\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m ✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
-ENGINE="" MODE=full PREBUILT=0 SAM=1
+# Run one shell command line with admin rights, asking once.
+as_admin() {
+    local cmd="$1"
+    if [[ -z "$SUDO" || $EUID -eq 0 ]]; then
+        sh -c "$cmd"
+    elif [[ $GUI == 1 && $OS == mac ]]; then
+        local esc=${cmd//\\/\\\\}; esc=${esc//\"/\\\"}
+        osascript -e "do shell script \"$esc\" with administrator privileges"
+    elif [[ $GUI == 1 ]]; then
+        command -v pkexec >/dev/null || die "No password dialog (pkexec) on this system. In a terminal run: sudo sh -c '$cmd'"
+        pkexec sh -c "$cmd"
+    else
+        $SUDO sh -c "$cmd"
+    fi
+}
+q() { printf '%q' "$1"; }   # quote a path for as_admin
+
+ENGINE="" MODE=full BUILD_FROM_SOURCE=0 SAM=1 GUI=0 FFMPEG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --engine) ENGINE="${2:?--engine needs a folder}"; shift 2 ;;
-        --prebuilt) PREBUILT=1; shift ;;
+        --engine) ENGINE="${2:-}"; shift 2 ;;
+        --ffmpeg) FFMPEG="${2:-}"; shift 2 ;;
+        --build) BUILD_FROM_SOURCE=1; shift ;;
+        --prebuilt) BUILD_FROM_SOURCE=0; shift ;;   # (default now; kept for old instructions)
+        --gui) GUI=1; shift ;;
         --no-sam) SAM=0; shift ;;
         --connect-only) MODE=connect; shift ;;
         --uninstall) MODE=uninstall; shift ;;
-        -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
 done
@@ -56,7 +81,7 @@ done
 if [[ $MODE == uninstall ]]; then
     if [[ -d "$OFX_DIR/$BUNDLE" ]]; then
         say "Removing $OFX_DIR/$BUNDLE (asks for your password)"
-        $SUDO rm -rf "$OFX_DIR/$BUNDLE"
+        as_admin "rm -rf $(q "$OFX_DIR/$BUNDLE")"
         rm -f "$MACRO_DIR/CorridorKey Outputs.setting"
         ok "Plugin removed. Cached keys are still in $CACHE_DIR (delete by hand if you want)."
     else
@@ -84,6 +109,7 @@ fi
 if [[ -z "$ENGINE" || ! -d "$ENGINE" ]]; then ENGINE="$HOME/apps/CorridorKey2.0"; fi
 ENGINE="${ENGINE/#\~/$HOME}"
 if ! valid_engine "$ENGINE"; then
+    [[ $GUI == 0 ]] || die "No CorridorKey 2.0 engine at $ENGINE (infer.py + venv/). Install the engine first."
     echo "No CorridorKey 2.0 engine found at: $ENGINE"
     read -r -p "Path to your CorridorKey2.0 folder (the one with infer.py and venv/): " ENGINE
     ENGINE="${ENGINE/#\~/$HOME}"
@@ -103,7 +129,8 @@ connect() {
     fi
     cp "$HERE/support/roto_daemon.py" "$CONF_DIR/roto_daemon.py"   # SAM 2 worker for the Roto node
     cp "$HERE/support/roto_picker.py" "$CONF_DIR/roto_picker.py"   # the Roto node's picker window
-    ff="$(command -v ffmpeg || true)"   # the engine needs ffmpeg even for EXR output
+    ff="$FFMPEG"                         # the engine needs ffmpeg even for EXR output
+    [[ -n "$ff" && -x "$ff" ]] || ff="$(command -v ffmpeg || true)"
     if [[ -z "$ff" ]]; then
         echo "   warning: ffmpeg not found – install it (the engine refuses to start without it)"
     fi
@@ -130,12 +157,15 @@ fi
 
 # ---------------------------------------------------------------- build
 BUILD="$HERE/build"
-if [[ $PREBUILT == 1 ]]; then
-    [[ $OS == linux ]] || die "--prebuilt is Linux only; on a Mac it has to be compiled."
-    say "Unpacking prebuilt plugin"
+if [[ $BUILD_FROM_SOURCE == 0 && -f "$PREBUILT_ZIP" ]]; then
+    say "Using the ready-made plugin ($(basename "$PREBUILT_ZIP"))"
     rm -rf "$BUILD/$BUNDLE"; mkdir -p "$BUILD"
-    (cd "$BUILD" && python3 -m zipfile -e "$HERE/prebuilt/CorridorKey2-ofx-linux.zip" .)
-    chmod +x "$BUILD/$BUNDLE/Contents/Linux-x86-64/CorridorKey2.ofx"
+    if command -v unzip >/dev/null; then
+        unzip -q -o "$PREBUILT_ZIP" -d "$BUILD"
+    else
+        (cd "$BUILD" && "$PY" -m zipfile -e "$PREBUILT_ZIP" .)
+    fi
+    chmod +x "$BUILD/$BUNDLE"/Contents/*/CorridorKey2.ofx 2>/dev/null || true
 else
     missing=()
     command -v cmake >/dev/null || missing+=(cmake)
@@ -143,29 +173,32 @@ else
     command -v c++   >/dev/null || command -v g++ >/dev/null || command -v clang++ >/dev/null \
         || missing+=(compiler)
     if [[ ${#missing[@]} -gt 0 ]]; then
-        say "Missing build tools: ${missing[*]}"
         if [[ $OS == mac ]]; then
-            [[ " ${missing[*]} " != *" compiler "* ]] || die "Run:  xcode-select --install   (click Install), then run this again."
-            command -v brew >/dev/null || die "Homebrew is needed: https://brew.sh"
-            brew install cmake git
-        elif command -v pacman >/dev/null; then
-            $SUDO pacman -S --needed --noconfirm cmake git base-devel
-        else
-            die "Install cmake, git and a C++ compiler with your package manager, or use --prebuilt."
+            [[ " ${missing[*]} " != *" compiler "* ]] || die "Run:  xcode-select --install   (click Install), then try again."
+            die "Install the build tools first:  brew install cmake git"
         fi
+        hint="your package manager"
+        if command -v apt-get >/dev/null; then hint="sudo apt install cmake git build-essential"
+        elif command -v dnf >/dev/null; then hint="sudo dnf install cmake git gcc-c++ make"
+        elif command -v pacman >/dev/null; then hint="sudo pacman -S --needed cmake git base-devel"
+        elif command -v zypper >/dev/null; then hint="sudo zypper install cmake git gcc-c++ make"
+        elif command -v emerge >/dev/null; then hint="sudo emerge --ask dev-build/cmake dev-vcs/git"
+        fi
+        die "No ready-made plugin for this system and missing build tools (${missing[*]}). Install them:  $hint"
     fi
     say "Building (the first build downloads the OpenFX SDK, ~1 min)"
     gen=(); command -v ninja >/dev/null && gen=(-G Ninja)
     cmake -S "$HERE" -B "$BUILD" "${gen[@]}" -DCMAKE_BUILD_TYPE=Release
     cmake --build "$BUILD" --config Release --parallel
 fi
-[[ -d "$BUILD/$BUNDLE/Contents" ]] || die "Build failed – paste the output above into the chat."
-ok "Built $BUILD/$BUNDLE"
+[[ -d "$BUILD/$BUNDLE/Contents" ]] || die "Build failed – use 'Report a bug' in ck2-gui (or paste the output above)."
+ok "Plugin ready: $BUILD/$BUNDLE"
 
 # ---------------------------------------------------------------- install
 say "Copying into $OFX_DIR (asks for your password)"
-$SUDO mkdir -p "$OFX_DIR/$BUNDLE"
-$SUDO cp -R "$BUILD/$BUNDLE/." "$OFX_DIR/$BUNDLE/"
+as_admin "mkdir -p $(q "$OFX_DIR/$BUNDLE") && cp -R $(q "$BUILD/$BUNDLE")/. $(q "$OFX_DIR/$BUNDLE")/"
+[[ -d "$OFX_DIR/$BUNDLE/Contents" ]] || die "Copying into $OFX_DIR didn't work (password cancelled?)."
+if [[ $OS == mac ]]; then xattr -dr com.apple.quarantine "$OFX_DIR/$BUNDLE" 2>/dev/null || true; fi
 ok "Installed $OFX_DIR/$BUNDLE"
 
 connect

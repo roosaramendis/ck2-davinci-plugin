@@ -46,9 +46,20 @@ def log(job: Path, msg: str):
 
 
 def atomic_write(path: Path, text: str):
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
     tmp.write_text(text)
-    os.replace(tmp, path)
+    replace_retry(tmp, path)
+
+
+def replace_retry(src: Path, dst: Path):
+    for i in range(50):  # Windows: the plugin may be reading dst right now
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == 49:
+                raise
+            time.sleep(0.05)
 
 
 def objects_of(req: dict):
@@ -94,8 +105,13 @@ class Sam:
             self.proc = T.Sam2VideoProcessor(image_processor=T.Sam2ImageProcessorFast(),
                                              video_processor=T.Sam2VideoVideoProcessor())
         else:
-            model = T.Sam2VideoModel.from_pretrained(name)
-            self.proc = T.Sam2VideoProcessor.from_pretrained(name)
+            try:  # already downloaded: no network (a flaky connection only slows things down)
+                model = T.Sam2VideoModel.from_pretrained(name, local_files_only=True)
+                self.proc = T.Sam2VideoProcessor.from_pretrained(name, local_files_only=True)
+            except OSError:
+                print(f"[roto] downloading {name} (once)", flush=True)
+                model = T.Sam2VideoModel.from_pretrained(name)
+                self.proc = T.Sam2VideoProcessor.from_pretrained(name)
         self.model = model.to(self.device, dtype=self.dtype).eval()
         self.name = name
 
@@ -166,9 +182,9 @@ def do_preview(sam: Sam, job: Path, req: dict):
             out = sam.model(inference_session=s, frame_idx=0)  # all objects together
             prob = sam.prob(out.pred_masks, w, h)
         cv2.imwrite(str(pv / f"mask_{frame:06d}.exr.tmp.exr"), prob, EXR_HALF)
-        os.replace(pv / f"mask_{frame:06d}.exr.tmp.exr", pv / f"mask_{frame:06d}.exr")
+        replace_retry(pv / f"mask_{frame:06d}.exr.tmp.exr", pv / f"mask_{frame:06d}.exr")
         cv2.imwrite(str(pv / "mask_view.tmp.png"), (np.clip(prob, 0, 1) * 255).round().astype(np.uint8))
-        os.replace(pv / "mask_view.tmp.png", pv / "mask_view.png")
+        replace_retry(pv / "mask_view.tmp.png", pv / "mask_view.png")
         atomic_write(pv / "done.json", json.dumps({"seq": req["seq"], "frame": frame}))
     except Exception as e:  # report, keep serving
         traceback.print_exc()
@@ -177,22 +193,25 @@ def do_preview(sam: Sam, job: Path, req: dict):
                                                    "error": f"{type(e).__name__}: {e}"}))
 
 
-def build_sam_frames(job: Path, count: int):
-    """Captured EXRs -> small JPEGs kept for re-tracking; EXRs deleted."""
+def build_sam_frames(job: Path, first: int, count: int):
+    """Captured EXRs (frames first..first+count-1) -> small JPEGs kept for
+    re-tracking; EXRs deleted. An existing set is reused."""
     sf = job / "sam"
     if (sf / "info.json").exists():
-        return read_json(sf / "info.json")
+        info = read_json(sf / "info.json")
+        info.setdefault("first", 0)
+        return info
     sf.mkdir(exist_ok=True)
     linear = job_linear(job)
     scale = 1.0
     for i in range(count):
         if (job / "cancel").exists() or not job.is_dir():
             raise KeyboardInterrupt
-        rgb, scale = load_rgb8(job / "src" / f"frame_{i:06d}.exr", linear)
+        rgb, scale = load_rgb8(job / "src" / f"frame_{first + i:06d}.exr", linear)
         cv2.imwrite(str(sf / f"{i:06d}.jpg"), rgb[..., ::-1], [cv2.IMWRITE_JPEG_QUALITY, 93])
         if i % 20 == 0:
             log(job, f"[roto] preparing frames {i + 1}/{count}")
-    info = {"n": count, "scale": scale}
+    info = {"first": first, "n": count, "scale": scale}
     atomic_write(sf / "info.json", json.dumps(info))
     for p in (job / "src").glob("*.exr"):
         p.unlink()
@@ -203,9 +222,12 @@ def do_track(sam: Sam, job: Path, req: dict):
     from PIL import Image
     code = "1"
     try:
-        n = int(req["count"])
-        frame = int(req["frame"])
-        info = build_sam_frames(job, n)
+        info = build_sam_frames(job, int(req.get("first", 0)), int(req["count"]))
+        first, n = int(info["first"]), int(info["n"])
+        frame = int(req["frame"]) - first  # index inside the tracked range
+        if not 0 <= frame < n:
+            raise ValueError(f"the picked frame {frame + first} is outside the captured frames "
+                             f"{first}-{first + n - 1}; pick on a frame inside them")
         sam.load(req.get("model") or DEFAULT_MODEL)
         files = sorted((job / "sam").glob("*.jpg"))
         imgs = [Image.open(p).convert("RGB") for p in files]
@@ -213,7 +235,8 @@ def do_track(sam: Sam, job: Path, req: dict):
         out = job / "masks"
         out.mkdir(exist_ok=True)
         done = 0
-        log(job, f"[roto] tracking {n} frames from frame {frame} with {sam.name} on {sam.device}")
+        log(job, f"[roto] tracking frames {first}-{first + n - 1} from frame {frame + first} "
+                 f"with {sam.name} on {sam.device}")
         with torch.inference_mode():
             s = sam.session(imgs)
             del imgs
@@ -222,9 +245,9 @@ def do_track(sam: Sam, job: Path, req: dict):
                 for o in sam.model.propagate_in_video_iterator(s, start_frame_idx=frame, reverse=rev):
                     if (job / "cancel").exists() or not job.is_dir():
                         raise KeyboardInterrupt
-                    p = out / f"mask_{o.frame_idx:06d}.exr"
+                    p = out / f"mask_{first + o.frame_idx:06d}.exr"
                     cv2.imwrite(str(p) + ".tmp.exr", sam.prob(o.pred_masks, w, h), EXR_HALF)
-                    os.replace(str(p) + ".tmp.exr", p)
+                    replace_retry(Path(str(p) + ".tmp.exr"), p)
                     done += 1
                     if done % 4 == 0 or done >= n:
                         log(job, f"      window {min(done, n)}/{n}")
@@ -239,18 +262,43 @@ def do_track(sam: Sam, job: Path, req: dict):
         atomic_write(job / "exitcode", code)
 
 
+def single_instance():
+    """Only one helper per cache folder (each one would load SAM 2 onto the GPU)."""
+    f = open(ROOT / "daemon.lock", "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return None
+    return f  # keep open = keep the lock
+
+
+def heartbeat():
+    """Runs in the background so loading/downloading the model never looks like a dead helper."""
+    while True:
+        try:
+            atomic_write(ROOT / "daemon.alive", f"{os.getpid()} {time.time():.0f}\n")
+        except OSError:
+            pass
+        time.sleep(2)
+
+
 def main():
+    import threading
     ROOT.mkdir(parents=True, exist_ok=True)
+    lock = single_instance()
+    if lock is None:
+        return  # another helper is already running
     sys.stdout = sys.stderr = open(ROOT / "daemon.log", "a", buffering=1)
+    threading.Thread(target=heartbeat, daemon=True).start()
     sam = Sam()
     last_work = time.time()
-    beat = 0.0
-    print(f"[roto] daemon on {sam.device}, watching {ROOT}", flush=True)
+    print(f"[roto] daemon {os.getpid()} on {sam.device}, watching {ROOT}", flush=True)
     while True:
-        now = time.time()
-        if now - beat > 2:
-            atomic_write(ROOT / "daemon.alive", f"{os.getpid()} {now:.0f}\n")
-            beat = now
         busy = False
         for job in sorted(p for p in ROOT.iterdir() if p.is_dir()):
             req = read_json(job / "preview" / "request.json")

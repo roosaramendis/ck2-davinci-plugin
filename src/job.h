@@ -51,6 +51,10 @@ JobStatus jobStatus(const std::string& cacheDir, const std::string& id, bool fre
 bool captureFrame(const std::string& cacheDir, const std::string& id, int idx,
                   std::vector<float>&& rgb, int w, int h, int x1, int y1, std::vector<float>&& hint);
 bool frameCaptured(const std::string& cacheDir, const std::string& id, int idx);  // or being written
+// Tell the job which frame the host is drawing while capturing. When playback
+// jumps from the end of the captured frames back to their start (it looped),
+// the job starts on those frames even if the host reported a longer clip.
+bool notePlayback(const std::string& cacheDir, const std::string& id, int idx);
 void waitForWrites();  // tests
 
 // Start the engine now on the longest unbroken run of captured frames.
@@ -79,8 +83,11 @@ PreviewState previewState(const std::string& rotoRoot, const std::string& id);
 std::string previewDir(const std::string& rotoRoot, const std::string& id);
 std::string previewMaskPath(const std::string& rotoRoot, const std::string& id, int idx);
 std::string trackMaskPath(const std::string& rotoRoot, const std::string& id, int idx);
-// Track the picked selection. Starts now if frames are ready, else after playback captured them.
-bool requestTrack(const std::string& rotoRoot, const std::string& id, std::string* err);
+// Track the picked selection. Starts now if frames are ready, else waits for playback to
+// capture them; pressed again while capturing, it tracks the captured part right away.
+enum class TrackStart { Failed, Started, WaitingForFrames };
+TrackStart requestTrack(const std::string& rotoRoot, const std::string& id, std::string* err);
+bool rotoDaemonAlive(const std::string& rotoRoot);
 bool trackWanted(const std::string& rotoRoot, const std::string& id);
 
 // Key names: the CorridorKey node publishes its key under a short name

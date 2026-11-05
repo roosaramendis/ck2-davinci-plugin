@@ -23,60 +23,54 @@ An OpenFX node can only have one output, so several passes come from Pass nodes
 
 ## Install
 
-### Linux and macOS
+### Easiest: with the CorridorKey app (ck2-gui)
 
-You need a working CorridorKey 2.0 engine folder, the one with `infer.py` and
-`venv/`. On a Mac it must be the official engine on the Apple GPU; the plugin
-can't use the MLX port.
+Open **Setup → DCC plugins → CorridorKey for DaVinci Resolve → Install**. The
+app downloads the latest release, installs it for your system (Linux, Windows or
+macOS), connects it to the engine it installed, and asks once for your password
+(Windows: "allow changes"). Restart Resolve afterwards.
 
-```
-bash install.sh
-```
+### By hand
 
-The script:
-- finds your engine (or asks for its folder),
-- builds the plugin,
-- copies it into Resolve's OFX folder (asks for your password),
-- writes the config that tells the plugin which engine to run.
+Download `ck2-davinci-plugin-<version>.zip` from the
+[releases](https://github.com/roosaramendis/ck2-davinci-plugin/releases) and
+unpack it. It contains ready-made plugins for all three systems, so nothing
+needs compiling. You also need a working CorridorKey 2.0 engine folder (the one
+with `infer.py` and `venv`); on a Mac it must be the official engine on the
+Apple GPU, not the MLX port.
 
-Restart Resolve afterwards.
+- **Linux (any distro) and macOS:** `bash install.sh --engine /path/to/CorridorKey2.0`
+- **Windows** (PowerShell):
+  `powershell -ExecutionPolicy Bypass -File install.ps1 -Engine C:\path\to\CorridorKey2.0`
 
-| Command | What it does |
-|---|---|
-| `bash install.sh --engine ~/path/CorridorKey2.0` | use this engine folder |
-| `bash install.sh --prebuilt` | Linux: no compiling, uses `prebuilt/` |
-| `bash install.sh --connect-only` | engine moved or reinstalled: only rewrite the config |
-| `bash install.sh --uninstall` | remove the plugin |
+| Option | install.sh | install.ps1 |
+|---|---|---|
+| choose the engine | `--engine DIR` | `-Engine DIR` |
+| engine moved: only rewrite the config | `--connect-only` | `-ConnectOnly` |
+| skip the SAM 2 download | `--no-sam` | `-NoSam` |
+| remove the plugin | `--uninstall` | `-Uninstall` |
+| compile instead of using the ready-made plugin | `--build` | – |
 
-Building needs `cmake`, `git` and a C++ compiler. On Arch/CachyOS the script
-installs them with pacman. On a Mac, run `xcode-select --install` and
-`brew install cmake` first.
-
-### Windows (by hand)
-
-1. Install CorridorKey 2.0 itself, following its own instructions:
-   <https://github.com/nikopueringer/CorridorKey2.0>. It must have a `venv`
-   folder with the Python packages and the downloaded weights.
-2. Copy `CorridorKey2.ofx.bundle` to
-   `C:\Program Files\Common Files\OFX\Plugins\`. It comes from
-   `prebuilt\CorridorKey2-ofx-windows.zip`, or from the GitHub Actions build.
-3. Create `%APPDATA%\ck2-davinci-plugin\ofx.conf` containing one line, with your own path:
-   ```
-   engine=C:\path\to\CorridorKey2.0
-   ```
-   Optional extra lines: `ffmpeg=C:\path\to\ffmpeg.exe` and
-   `cache_dir=D:\corridorkey-cache`. For the Roto node, also copy
-   `support\roto_daemon.py` and `support\roto_picker.py` next to that `ofx.conf`
-   and install PySide6 into the engine's Python.
-4. For the multi-output macro, copy `fusion\CorridorKey Outputs.setting` to
-   `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Macros\`.
-5. Restart Resolve.
+Compiling (`--build`, or a source checkout without `prebuilt/`) needs `cmake`,
+`git` and a C++ compiler; on a Mac, `xcode-select --install` and
+`brew install cmake`.
 
 | OS      | Plugin folder                              | Config file                                        |
 |---------|--------------------------------------------|----------------------------------------------------|
-| Linux   | `/usr/OFX/Plugins`                         | `~/.config/ck2-davinci-plugin/ofx.conf`                       |
-| macOS   | `/Library/OFX/Plugins`                     | `~/Library/Application Support/ck2-davinci-plugin/ofx.conf`   |
-| Windows | `C:\Program Files\Common Files\OFX\Plugins`| `%APPDATA%\ck2-davinci-plugin\ofx.conf`                       |
+| Linux   | `/usr/OFX/Plugins`                         | `~/.config/ck2-davinci-plugin/ofx.conf`            |
+| macOS   | `/Library/OFX/Plugins`                     | `~/Library/Application Support/ck2-davinci-plugin/ofx.conf` |
+| Windows | `C:\Program Files\Common Files\OFX\Plugins`| `%APPDATA%\ck2-davinci-plugin\ofx.conf`             |
+
+### Problems?
+
+Press **Report a bug** on the CorridorKey node (or in the ck2-gui app). It opens a
+GitHub issue with the latest log lines filled in, plus the log folder.
+
+### Publishing a release (maintainer)
+
+Push a tag like `v1.0.0`. GitHub Actions builds the plugin for Linux, Windows and
+macOS and publishes `ck2-davinci-plugin-v1.0.0.zip`, which ck2-gui then offers
+as an update.
 
 ## Use
 
@@ -135,7 +129,10 @@ rename it.
 
    After each change the mask is shown in red after a moment; the first time
    takes longer while SAM 2 loads. Press **Use this selection** when it's right.
-3. Press **Track clip**, then **play the clip once**. Tracking then runs in the
+3. Press **Track clip**, then **play the clip once**. It only needs the frames
+   that actually play (a clip cut shorter in the edit is fine). If it ever waits
+   for more, let playback loop back to the start, or press **Track captured
+   frames now**. Tracking then runs in the
    background (`ROTO: TRACKING 40%`). If you pick again later, Track clip
    doesn't need another playback.
 4. **Output** (default **Hint matte**). **Overlay** shows the mask over the

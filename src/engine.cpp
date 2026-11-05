@@ -6,6 +6,7 @@
 #include <fstream>
 #include <random>
 #include <sstream>
+#include <thread>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -181,9 +182,14 @@ bool writeTextAtomic(const std::string& path, const std::string& text) {
         if (!f) return false;
     }
     std::error_code ec;
-    fs::rename(tmp, path, ec);
-    if (ec) fs::remove(tmp, ec);
-    return !ec;
+    for (int i = 0; i < 50; ++i) {  // Windows refuses to replace a file another process has open
+        fs::rename(tmp, path, ec);
+        if (!ec) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    std::error_code ec2;
+    fs::remove(tmp, ec2);
+    return false;
 }
 
 bool makeDirs(const std::string& path) {

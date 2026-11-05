@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -197,6 +198,66 @@ inline std::string describeException() {
     } catch (...) {
         return "unknown exception";
     }
+}
+
+// ------------------------------------------------------------ bug report
+
+inline std::string urlEncode(const std::string& s) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string o;
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') o += (char)c;
+        else if (c == ' ') o += '+';
+        else { o += '%'; o += hex[c >> 4]; o += hex[c & 15]; }
+    }
+    return o;
+}
+
+// Open a URL or folder with the system's default app (browser / file manager).
+inline void openWithSystem(const std::string& target) {
+    std::string err;
+#ifdef _WIN32
+    ck::spawnDetached({"C:\\Windows\\explorer.exe", target}, {}, "", &err);
+#elif defined(__APPLE__)
+    ck::spawnDetached({"/usr/bin/open", target}, {}, "", &err);
+#else
+    ck::spawnDetached({"/usr/bin/xdg-open", target}, {{"LD_LIBRARY_PATH", ck::kEnvUnset}}, "", &err);
+#endif
+}
+
+inline std::string fileTail(const std::string& path, size_t maxLines) {
+    std::string s;
+    if (!ck::readText(path, s)) return "";
+    std::vector<std::string> lines;
+    std::stringstream ss(s);
+    std::string l;
+    while (std::getline(ss, l)) lines.push_back(l);
+    std::string out;
+    for (size_t i = lines.size() > maxLines ? lines.size() - maxLines : 0; i < lines.size(); ++i) out += lines[i] + "\n";
+    return out;
+}
+
+// Opens a pre-filled GitHub issue for the plugin + the folder with its logs.
+inline void reportBug(const std::string& hostText, const std::string& nodeName, const std::string& status) {
+    std::string cache = ck::loadConfig().cacheDir;
+    std::string body = "**What happened**\n\n(describe what you did and what you expected)\n\n**System**\n"
+                       "- Host: " + hostText + "\n- Node: " + nodeName + "\n- Status: " + status +
+#ifdef _WIN32
+                       "\n- OS: Windows"
+#elif defined(__APPLE__)
+                       "\n- OS: macOS"
+#else
+                       "\n- OS: Linux"
+#endif
+                       "\n\n**Logs**\nThe plugin's log folder was just opened: please drag `plugin.log` "
+                       "(and the newest job folder's engine.log) into this issue.\n\n```\n";
+    std::string tail = fileTail(ck::joinPath(cache, "plugin.log"), 40);
+    if (tail.size() > 4000) tail = tail.substr(tail.size() - 4000);
+    body += tail + "```\n";
+    std::string url = "https://github.com/roosaramendis/ck2-davinci-plugin/issues/new?labels=bug&title=" +
+                      urlEncode("[" + nodeName + "] ") + "&body=" + urlEncode(body);
+    openWithSystem(url);
+    openWithSystem(cache);
 }
 
 // Split rows over a few threads (4K frames are slow single-threaded).
@@ -399,7 +460,58 @@ inline void copySource(OFX::Image* dst, OFX::Image* src, const OfxRectI& win) {
     });
 }
 
+// Frames the host will actually play. The Source clip can report the whole media
+// (a clip trimmed in the timeline / a Fusion comp shorter than its MediaIn), so the
+// range is narrowed to the output clip, the effect's range and the timeline when the
+// host reports them. `how` describes what was found (for the log).
+inline OfxRangeD playableRange(OFX::ImageEffect* fx, OFX::Clip* src, OFX::Clip* dst, std::string* how) {
+    OfxRangeD r = src->getFrameRange();
+    std::ostringstream o;
+    o << "source " << r.min << ".." << r.max;
+    auto narrow = [&](const char* what, double a, double b) {
+        o << ", " << what << " " << a << ".." << b;
+        if (b < a || (a == 0 && b == 0)) return;  // not reported
+        double lo = std::max(r.min, a), hi = std::min(r.max, b);
+        // Ignore ranges that overlap the clip by less than 2 frames (Edit page
+        // timeline numbers, a host's "unknown" single frame).
+        if (hi - lo < 1.0) {
+            o << " (ignored)";
+            return;
+        }
+        r = {lo, hi};
+    };
+    try {
+        OfxRangeD d = dst->getFrameRange();
+        narrow("output", d.min, d.max);
+    } catch (...) {
+    }
+    try {
+        const OFX::PropertySet& ps = fx->getPropertySet();
+        narrow("effect", ps.propGetDouble(kOfxImageEffectPropFrameRange, 0),
+               ps.propGetDouble(kOfxImageEffectPropFrameRange, 1));
+    } catch (...) {
+    }
+    try {
+        if (OFX::getImageEffectHostDescription()->supportsTimeLineSuite) {
+            double t1 = 0, t2 = 0;
+            fx->timeLineGetBounds(t1, t2);
+            narrow("timeline", t1, t2);
+        }
+    } catch (...) {
+    }
+    try {
+        double dur = fx->getEffectDuration();
+        if (dur >= 2) narrow("duration", r.min, r.min + dur - 1);
+    } catch (...) {
+    }
+    o << " -> " << r.min << ".." << r.max;
+    if (how) *how = o.str();
+    return r;
+}
+
 enum OutputMode { eCutout = 0, eMatte, eForeground, eChecker, eSource };
+
+
 
 // Draw a keyed frame (from the cache) into dst. Returns false if aborted.
 inline void renderKeyed(OFX::Image* dst, const OfxRectI& rw, const OfxPointD& renderScale, const CachedFrame& f,

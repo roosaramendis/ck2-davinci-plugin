@@ -33,10 +33,23 @@ from PySide6.QtWidgets import (QApplication, QGraphicsEllipseItem, QGraphicsPixm
 COLORS = ["#3ddc84", "#4fc3f7", "#ffd54f", "#ff8a65", "#ba68c8", "#4db6ac", "#f06292", "#aed581"]
 
 
+def replace_retry(src, dst, tries: int = 20):
+    """os.replace, retried: on Windows it fails while another program (Resolve
+    reading a mask) has the target open for a moment."""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(0.05)
+
+
 def atomic_write(path: Path, text: str):
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
     tmp.write_text(text)
-    os.replace(tmp, path)
+    replace_retry(tmp, path, 50)
 
 
 def read_json(path: Path):

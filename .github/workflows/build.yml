@@ -1,12 +1,13 @@
-# Builds the DaVinci Resolve OFX plugin (CorridorKey2.ofx.bundle) for
-# Linux, Windows and macOS (universal: Apple Silicon + Intel).
-# Push a tag like "v1" to also attach the zips to a GitHub release.
+# Builds the DaVinci Resolve plugin for Linux, Windows and macOS (Apple Silicon +
+# Intel). On a tag like v1.2.0 it also publishes a GitHub release with
+#   ck2-davinci-plugin-v1.2.0.zip   = this repo + ready-made plugins for all 3 systems
+# which is what the ck2-gui app downloads (Setup → DCC plugins).
 name: Build ck2-davinci-plugin
 
 on:
   push:
-    tags: ["v*"]
     branches: ["**"]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -32,13 +33,13 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Check exports (Linux)
+      - name: Check (Linux)
         if: matrix.name == 'linux'
         run: |
           nm -D --defined-only build/CorridorKey2.ofx.bundle/Contents/Linux-x86-64/CorridorKey2.ofx | grep OfxGet
           ldd build/CorridorKey2.ofx.bundle/Contents/Linux-x86-64/CorridorKey2.ofx
 
-      - name: Check exports (macOS)
+      - name: Check + sign (macOS)
         if: matrix.name == 'macos'
         run: |
           lipo -info build/CorridorKey2.ofx.bundle/Contents/MacOS/CorridorKey2.ofx
@@ -52,7 +53,7 @@ jobs:
           if [ "${{ matrix.name }}" = windows ]; then
             7z a ../CorridorKey2-ofx-${{ matrix.name }}.zip CorridorKey2.ofx.bundle
           else
-            zip -r ../CorridorKey2-ofx-${{ matrix.name }}.zip CorridorKey2.ofx.bundle
+            zip -qr ../CorridorKey2-ofx-${{ matrix.name }}.zip CorridorKey2.ofx.bundle
           fi
 
       - uses: actions/upload-artifact@v4
@@ -60,8 +61,35 @@ jobs:
           name: CorridorKey2-ofx-${{ matrix.name }}
           path: CorridorKey2-ofx-${{ matrix.name }}.zip
 
-      - name: Attach to release
+  package:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble the installable zip
+        run: |
+          name="ck2-davinci-plugin-${GITHUB_REF_NAME//\//-}"
+          mkdir -p "dist/$name"
+          git archive HEAD | tar -x -C "dist/$name"
+          rm -rf "dist/$name/prebuilt" && mkdir -p "dist/$name/prebuilt"
+          cp artifacts/*/CorridorKey2-ofx-*.zip "dist/$name/prebuilt/"
+          ls -la "dist/$name/prebuilt"
+          (cd dist && zip -qr "$name.zip" "$name")
+          echo "ZIP=dist/$name.zip" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ck2-davinci-plugin
+          path: ${{ env.ZIP }}
+
+      - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: CorridorKey2-ofx-${{ matrix.name }}.zip
+          files: ${{ env.ZIP }}
+          generate_release_notes: true

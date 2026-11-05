@@ -1,0 +1,23 @@
+{
+  "name": "CorridorKey for DaVinci Resolve",
+  "app": "DaVinci Resolve 21+ (Free and Studio)",
+  "description": "Key, Roto (SAM 2 click-to-track) and Pass nodes for the Edit, Color and Fusion pages, plus a multi-output Fusion macro.",
+  "platforms": ["linux", "windows", "macos"],
+  "asset": "ck2-davinci-plugin-*.zip",
+  "install": {
+    "linux":   ["bash", "install.sh", "--gui", "--engine", "{engine}", "--ffmpeg", "{ffmpeg}"],
+    "macos":   ["bash", "install.sh", "--gui", "--engine", "{engine}", "--ffmpeg", "{ffmpeg}"],
+    "windows": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "install.ps1",
+                "-Engine", "{engine}", "-Ffmpeg", "{ffmpeg}"]
+  },
+  "uninstall": {
+    "linux":   ["bash", "install.sh", "--gui", "--uninstall"],
+    "macos":   ["bash", "install.sh", "--gui", "--uninstall"],
+    "windows": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "install.ps1", "-Uninstall"]
+  },
+  "installed_path": {
+    "linux":   "/usr/OFX/Plugins/CorridorKey2.ofx.bundle",
+    "macos":   "/Library/OFX/Plugins/CorridorKey2.ofx.bundle",
+    "windows": "%CommonProgramFiles%\\OFX\\Plugins\\CorridorKey2.ofx.bundle"
+  }
+}

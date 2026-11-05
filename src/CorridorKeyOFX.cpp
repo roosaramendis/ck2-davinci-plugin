@@ -67,6 +67,7 @@ namespace fs = std::filesystem;
 #define kEditionInfo "editionInfo"
 #define kKeyData "keyData"
 #define kKeyName "keyName"
+#define kReport "reportBug"
 #define kHintMode "hintMode"
 
 static const char* kWindows[] = {"Auto (from free GPU memory)", "80/40 – steadiest, most memory", "48/24",
@@ -78,8 +79,8 @@ static std::string statusText(const ck::JobStatus& st) {
     case ck::JobState::Missing: return "Not keyed yet. Press 'Key clip'.";
     case ck::JobState::Capturing:
         o << "Capturing frames: " << st.captured << " of " << st.count
-          << ". Play the clip once from start to end; keying starts by itself. "
-             "(Or press 'Key captured frames now'.)";
+          << ". Play the clip once from start to end; keying starts by itself (also when playback "
+             "loops back). Or press 'Key captured frames now'.";
         return o.str();
     case ck::JobState::Keying:
         if (st.cancelling) return "Stopping…";
@@ -257,7 +258,10 @@ void CorridorKeyPlugin::render(const OFX::RenderArguments& args) {
         Banner bn;
         switch (st.state) {
         case ck::JobState::Capturing:
-            if (src && idx >= 0 && idx < k.count && fullRes) capture(k, idx, src.get(), args.time);
+            if (src && idx >= 0 && idx < k.count && fullRes) {
+                capture(k, idx, src.get(), args.time);
+                if (ck::notePlayback(cache, k.id, idx)) plog("job " + k.id + ": playback looped, keying the captured frames");
+            }
             if (!fullRes) {
                 bn = {"CORRIDORKEY: SET PLAYBACK TO FULL RESOLUTION (PROXY OFF) TO CAPTURE", 1.0f, 0.75f, 0.1f};
             } else {
@@ -314,7 +318,7 @@ void CorridorKeyPlugin::changedParam(const OFX::InstanceChangedArgs& args, const
         return;
     }
     static const char* reasons[] = {"user", "plugin", "time"};
-    if (name == kKey || name == kKeyNow || name == kStop || name == kForget || name == kExport)
+    if (name == kKey || name == kKeyNow || name == kStop || name == kForget || name == kExport || name == kReport)
         plog("button '" + name + "' (reason: " + reasons[std::clamp((int)args.reason, 0, 2)] + ")");
     try {
         if (name == kKey) keyClip();
@@ -323,6 +327,11 @@ void CorridorKeyPlugin::changedParam(const OFX::InstanceChangedArgs& args, const
         else if (name == kRefresh) refresh();
         else if (name == kForget) forgetKey();
         else if (name == kExport) exportExr();
+        else if (name == kReport) {
+            std::string st;
+            try { status_->getValue(st); } catch (...) {}
+            reportBug(detectHost().text, "CorridorKey 2.0", st);
+        }
     } catch (...) {
         std::string why = describeException();
         plog("button '" + name + "' failed: " + why);
@@ -389,12 +398,13 @@ void CorridorKeyPlugin::keyClip() {
         sendMessage(OFX::Message::eMessageError, "", "Nothing connected to the Source input.");
         return;
     }
-    OfxRangeD range = src_->getFrameRange();
+    std::string how;
+    OfxRangeD range = playableRange(this, src_, dst_, &how);
     // Fusion reports e.g. 0..361.9999 for frames 0-361, Resolve/others 0..361.
     // (0.9999 is 1e-4 short of the next frame, so the tolerance must be smaller.)
     int t0 = (int)std::ceil(range.min - 1e-5), t1 = (int)std::floor(range.max + 1e-5);
     int n = t1 - t0 + 1;
-    plog("Key clip: source frame range " + std::to_string(range.min) + ".." + std::to_string(range.max));
+    plog("Key clip: frame range " + how);
     if (n < 1 || n > 1000000) {
         setStatus("✗ The host reported an invalid frame range for this clip.");
         sendMessage(OFX::Message::eMessageError, "", "The host reported an invalid frame range for this clip.");
@@ -674,6 +684,11 @@ void CorridorKeyPluginFactory::describeInContext(OFX::ImageEffectDescriptor& des
     ex->setLabel("Export EXRs");
     ex->setHint("Writes corridorkey_alpha / _fg / _cutout.######.exr (scene-linear) for Fusion or Nuke.");
     page->addChild(*ex);
+
+    OFX::PushButtonParamDescriptor* rep = desc.definePushButtonParam(kReport);
+    rep->setLabel("Report a bug");
+    rep->setHint("Opens a GitHub issue with the latest log lines filled in, and the log folder.");
+    page->addChild(*rep);
 
     OFX::StringParamDescriptor* hi = desc.defineStringParam(kHostInfo);
     hi->setLabel("Host");

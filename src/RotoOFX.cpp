@@ -75,7 +75,7 @@ public:
         std::error_code ec;
         auto t = fs::last_write_time(path, ec);
         if (ec) return nullptr;
-        std::string key = path + "@" + std::to_string(t.time_since_epoch().count());
+        std::string key = path + "@" + std::to_string(static_cast<long long>(t.time_since_epoch().count()));
         std::lock_guard<std::mutex> lock(mu_);
         auto it = map_.find(key);
         if (it != map_.end()) return it->second;

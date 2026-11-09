@@ -16,7 +16,7 @@ playback and scrubbing are instant.
 | **CorridorKey 2.0** | Keys the clip (in the background) and outputs one pass: cutout, matte, foreground or checker. |
 | **CorridorKey Pass** | Outputs one pass of a key, found by its **Key name**. Use several to get several passes at once; nothing is keyed twice. |
 | **CorridorKey Outputs** (Fusion macro) | One node with **Cutout / Alpha / Foreground / Checker** outputs, built from four Pass nodes. Fusion page only. |
-| **CorridorKey Roto** | Click-to-track roto with SAM 2.1: click / drag rectangles on the characters in a picker window, it tracks them through the clip and outputs a **hint matte** for CorridorKey's Hint input, or the **source with everything else filled with screen colour**. |
+| **CorridorKey Roto** | Click-to-track roto with SAM 2.1: click / drag rectangles on whatever you want to keep (people, props, areas) in a picker window, it tracks them through the clip and outputs a **hint matte** for CorridorKey's Hint input, or the **source with everything else filled with screen colour**. |
 
 An OpenFX node can only have one output, so several passes come from Pass nodes
 (or the macro, which bundles them).
@@ -66,11 +66,6 @@ Compiling (`--build`, or a source checkout without `prebuilt/`) needs `cmake`,
 Press **Report a bug** on the CorridorKey node (or in the ck2-gui app). It opens a
 GitHub issue with the latest log lines filled in, plus the log folder.
 
-### Publishing a release (maintainer)
-
-Push a tag like `v1.0.0`. GitHub Actions builds the plugin for Linux, Windows and
-macOS and publishes `ck2-davinci-plugin-v1.0.0.zip`, which ck2-gui then offers
-as an update.
 
 ## Use
 
@@ -114,16 +109,20 @@ rename it.
 - **Fusion page:** *Add Tool → Macros → CorridorKey Outputs*, then type the key
   name once. The node has Cutout, Alpha, Foreground and Checker outputs.
 
-### Keep only one character: CorridorKey Roto
+### Keep only what you want: CorridorKey Roto
+
+Use it to keep anything in the shot (people, props, a car, a whole area) and
+drop the rest.
 
 1. Wire it up. The clip goes into **both** nodes: MediaIn → **CorridorKey Roto**,
    and MediaIn → **CorridorKey 2.0**. The Roto output goes into CorridorKey's
    **Hint** input (the second, green triangle).
-2. Go to a frame where the character is clear and press **Pick character…**. A
+2. Go to a frame where what you want to keep is clearly visible and press
+   **Pick character…** (it works for any object, not only characters). A
    window opens on that frame:
-   - **click** on the character to keep it,
-   - **right-click** on things to remove (another person, a light stand),
-   - **drag** a rectangle around a character or area; each rectangle is its own
+   - **click** on something to keep it,
+   - **right-click** on things to remove (a light stand, a crew member, a rig),
+   - **drag** a rectangle around an object or area; each rectangle is its own
      object, so add as many as you need,
    - wheel zooms, middle-drag pans, Ctrl+Z undoes.
 
@@ -137,7 +136,7 @@ rename it.
    doesn't need another playback.
 4. **Output** (default **Hint matte**). **Overlay** shows the mask over the
    picture to check it. **Garbage-filled source** fills everything outside the
-   character with screen colour; use it on the Edit/Color page, where there's no
+   picked objects with screen colour; use it on the Edit/Color page, where there's no
    Hint input, by putting CorridorKey 2.0 *after* the Roto node.
 5. Wait for **✓ Tracked** in the Roto status, *then* press Key clip on the
    CorridorKey node.

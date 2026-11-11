@@ -66,11 +66,6 @@ Compiling (`--build`, or a source checkout without `prebuilt/`) needs `cmake`,
 Press **Report a bug** on the CorridorKey node (or in the ck2-gui app). It opens a
 GitHub issue with the latest log lines filled in, plus the log folder.
 
-### Publishing a release (maintainer)
-
-Push a tag like `v1.0.0`. GitHub Actions builds the plugin for Linux, Windows and
-macOS and publishes `ck2-davinci-plugin-v1.0.0.zip`, which ck2-gui then offers
-as an update.
 
 ## Use
 

@@ -89,6 +89,7 @@ EngineConfig loadConfig() {
         else if (k == "roto_daemon") c.rotoScript = v;
         else if (k == "roto_picker") c.pickerScript = v;
         else if (k == "sam_model") c.samModel = v;
+        else if (k == "auto_refresh") c.autoRefresh = !(v == "0" || v == "false" || v == "no" || v == "off");
     }
     // Only "engine=" is required; the venv Python is found inside it.
     if (c.python.empty() && !c.engine.empty()) {

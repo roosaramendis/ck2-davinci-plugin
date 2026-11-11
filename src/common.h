@@ -3,6 +3,10 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -199,6 +203,229 @@ inline std::string describeException() {
         return "unknown exception";
     }
 }
+
+inline bool autoRefreshAllowed() {
+    static const bool on = ck::loadConfig().autoRefresh;
+    return on;
+}
+
+// "14:03:21", for "updated …" in the Status lines.
+inline std::string clockText() {
+    std::time_t t = std::time(nullptr);
+    char ts[16];
+    std::strftime(ts, sizeof(ts), "%H:%M:%S", std::localtime(&t));
+    return ts;
+}
+
+// <root>/<id>/notify asks the background job for a desktop notification when it
+// ends. The first line names the key ("key-3f2a") for the message.
+inline void setNotify(const std::string& root, const std::string& id, const std::string& label, bool on) {
+    if (root.empty() || id.empty()) return;
+    std::string dir = ck::joinPath(root, id), f = ck::joinPath(dir, "notify");
+    if (on) {
+        if (ck::fileExists(dir)) ck::writeTextAtomic(f, label + "\n");
+    } else {
+        std::error_code ec;
+        std::filesystem::remove(f, ec);
+    }
+}
+
+// ============================================================ auto refresh
+//
+// A host only redraws the viewer (and shows new Inspector text) when a parameter
+// changes. A key finishing in the background changes nothing, so the viewer kept
+// showing "KEYING 45%" until someone pressed the refresh button. AutoRefresh is a
+// small thread per node: while a job runs it checks it every 2 s and, when
+// something visible changed, updates the Status line and bumps the hidden
+// "refresh" parameter so the host redraws. It sleeps while nothing is running and
+// wakes up on the next render or button.
+//
+// OpenFX doesn't promise that hosts accept parameter changes from a plugin's own
+// thread. So if the host refuses one, auto refresh switches off for that node (and
+// says so in plugin.log); "auto_refresh=0" in ofx.conf switches it off everywhere.
+struct RefreshState {
+    std::string status;  // text for the Status line
+    std::string stage;   // a change here updates the Status line at once (else at most every 5 s)
+    std::string view;    // a change here redraws the viewer
+    bool active = false; // a job is running / waiting: keep checking
+    bool stamp = false;  // add "(updated 14:03:21)" to the Status line
+};
+
+class AutoRefresh {
+public:
+    using Poll = std::function<RefreshState()>;
+    using SetStatus = std::function<void(const std::string&)>;  // throws if the host refuses
+    using Redraw = std::function<void()>;                       // throws if the host refuses
+
+    AutoRefresh(std::string who, Poll poll, SetStatus setStatus, Redraw redraw) : s_(std::make_shared<Shared>()) {
+        s_->who = std::move(who);
+        s_->poll = std::move(poll);
+        s_->setStatus = std::move(setStatus);
+        s_->redraw = std::move(redraw);
+    }
+    ~AutoRefresh() { stop(); }
+    AutoRefresh(const AutoRefresh&) = delete;
+    AutoRefresh& operator=(const AutoRefresh&) = delete;
+
+    bool enabled() const { return autoRefreshAllowed() && !s_->refused; }
+
+    // Something may be happening (a render, a button). `drawn` = what the viewer
+    // shows now (the RefreshState::view the render used), or "" if unknown.
+    void wake(const std::string& drawn = "") {
+        if (!enabled()) return;
+        std::lock_guard<std::mutex> lock(s_->mu);
+        if (s_->quit) return;
+        if (!drawn.empty()) s_->drawn = drawn;
+        s_->woken = true;
+        if (!started_) {
+            started_ = true;
+            std::shared_ptr<Shared> sh = s_;
+            thread_ = std::thread([sh] { loop(sh); });
+        }
+        s_->cv.notify_all();
+    }
+
+    // A button just showed this state itself: don't repeat it.
+    void seen(const RefreshState& st) {
+        std::lock_guard<std::mutex> lock(s_->mu);
+        s_->stage = st.stage;
+        s_->status = st.status;
+        s_->drawn = s_->bumped = st.view;
+        s_->lastStatus = std::chrono::steady_clock::now();
+    }
+
+    // Text for a Status line, with the time when it's a running job.
+    std::string decorate(const RefreshState& st) const { return decorate(st, enabled()); }
+    static std::string decorate(const RefreshState& st, bool automatic) {
+        if (!st.stamp) return st.status;
+        return st.status + (automatic ? "  (updated " + clockText() + ", updates by itself)"
+                                      : "  (checked " + clockText() + "; press 'Refresh now' to update)");
+    }
+
+    // Called when the node is deleted. Never waits long: if the thread is stuck in
+    // a host call (a host could be waiting for the very thread that is deleting
+    // the node), it is left to finish that call and then exits without touching
+    // the node again.
+    void stop() {
+        if (!started_) return;
+        std::unique_lock<std::mutex> lock(s_->mu);
+        s_->quit = true;
+        s_->cv.notify_all();
+        bool idle = s_->cv.wait_for(lock, std::chrono::seconds(2), [&] { return !s_->busy; });
+        lock.unlock();
+        if (idle) thread_.join();
+        else {
+            plog(s_->who + ": auto refresh was busy while the node closed; leaving it to finish");
+            thread_.detach();
+        }
+        started_ = false;
+    }
+
+private:
+    struct Shared {
+        std::string who;
+        Poll poll;
+        SetStatus setStatus;
+        Redraw redraw;
+        std::mutex mu;
+        std::condition_variable cv;
+        bool quit = false, woken = false, busy = false;
+        std::atomic<bool> refused{false};
+        std::string stage, status, drawn, bumped;
+        std::chrono::steady_clock::time_point lastStatus{};
+    };
+
+    // Runs `f` outside the lock (it may call the host). False = node closing.
+    template <class F>
+    static bool outside(Shared& s, std::unique_lock<std::mutex>& lock, F&& f) {
+        if (s.quit) return false;
+        s.busy = true;
+        lock.unlock();
+        f();
+        lock.lock();
+        s.busy = false;
+        s.cv.notify_all();
+        return !s.quit;
+    }
+
+    static void loop(std::shared_ptr<Shared> sp) {
+        using clock = std::chrono::steady_clock;
+        Shared& s = *sp;
+        std::unique_lock<std::mutex> lock(s.mu);
+        auto lastPoll = clock::now() - std::chrono::seconds(10);
+        while (!s.quit && !s.refused) {
+            s.woken = false;
+            RefreshState st;
+            bool ok = true;
+            if (!outside(s, lock, [&] {
+                    try {
+                        st = s.poll();
+                    } catch (...) {
+                        ok = false;
+                    }
+                }))
+                break;
+            lastPoll = clock::now();
+            if (ok) {
+                auto now = clock::now();
+                bool redraw = !st.view.empty() && st.view != s.drawn && st.view != s.bumped;
+                bool text = !st.status.empty() &&
+                            (st.stage != s.stage || (st.status != s.status && now - s.lastStatus >= std::chrono::seconds(5)) ||
+                             (st.stamp && now - s.lastStatus >= std::chrono::seconds(30)));
+                std::string why;
+                auto guarded = [&](auto&& call) {
+                    try {
+                        call();
+                    } catch (...) {
+                        why = describeException();
+                        s.refused = true;
+                    }
+                };
+                if (text) {
+                    std::string shown = decorate(st, true);
+                    if (!outside(s, lock, [&] { guarded([&] { s.setStatus(shown); }); })) break;
+                    if (!s.refused) {
+                        s.stage = st.stage;
+                        s.status = st.status;
+                        s.lastStatus = now;
+                    }
+                }
+                if (redraw && !s.refused) {
+                    if (!outside(s, lock, [&] { guarded([&] { s.redraw(); }); })) break;
+                    if (!s.refused) s.bumped = st.view;
+                }
+                if (s.refused) {
+                    plog(s.who + ": the host refused an automatic update (" + why +
+                         "); auto refresh is off for this node, use 'Refresh now'");
+                    // Don't leave "updates by itself" on screen (if the Status line still takes text).
+                    std::string manual = decorate(st, false);
+                    outside(s, lock, [&] {
+                        try {
+                            s.setStatus(manual);
+                        } catch (...) {
+                        }
+                    });
+                    break;
+                }
+            }
+            if (ok && st.active) {
+                s.cv.wait_for(lock, std::chrono::seconds(2), [&] { return s.quit; });
+            } else {
+                // Nothing running: sleep until the next render / button (at most one check per second).
+                s.cv.wait(lock, [&] { return s.quit || s.woken; });
+                auto next = lastPoll + std::chrono::seconds(1);
+                if (!s.quit && clock::now() < next) s.cv.wait_until(lock, next, [&] { return s.quit; });
+            }
+        }
+        s.busy = false;
+        s.cv.notify_all();
+    }
+
+    std::shared_ptr<Shared> s_;
+    std::thread thread_;
+    bool started_ = false;  // only touched by host threads that hold s_->mu, or by stop()
+};
+
 
 // ------------------------------------------------------------ bug report
 

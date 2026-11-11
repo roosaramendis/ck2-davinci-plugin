@@ -25,7 +25,20 @@ public:
         pass_ = fetchChoiceParam(kPPass);
         status_ = fetchStringParam(kPStatus);
         tick_ = fetchIntParam(kPTick);
+        auto_ = std::make_unique<AutoRefresh>(
+            "Pass node", [this] { return refreshState(); },
+            [this](const std::string& text) {
+                std::string cur;
+                status_->getValue(cur);
+                if (cur != text) status_->setValue(text);
+            },
+            [this] {
+                int t = 0;
+                tick_->getValue(t);
+                tick_->setValue(t + 1);
+            });
     }
+    ~CorridorKeyPass() override { auto_->stop(); }
 
     void getClipPreferences(OFX::ClipPreferencesSetter& prefs) override {
         prefs.setClipComponents(*dst_, OFX::ePixelComponentRGBA);
@@ -74,9 +87,13 @@ public:
             return;
         }
         if (ck::safeKeyName(name).empty()) return show("CORRIDORKEY PASS: TYPE THE KEY NAME IN THE INSPECTOR", 0.9f, 0.3f, 0.3f);
-        if (!ref.valid()) return show("NO KEY NAMED '" + ck::safeKeyName(name) + "' YET", 0.9f, 0.3f, 0.3f);
+        if (!ref.valid()) {
+            auto_->wake(viewSig(ref, ck::JobStatus{}));
+            return show("NO KEY NAMED '" + ck::safeKeyName(name) + "' YET", 0.9f, 0.3f, 0.3f);
+        }
         const std::string cache = cachedCacheDir();
         ck::JobStatus st = ck::jobStatus(cache, ref.id);
+        auto_->wake(viewSig(ref, st));
         char line[160];
         switch (st.state) {
         case ck::JobState::Done: break;
@@ -85,8 +102,9 @@ public:
                           st.captured, st.count);
             return show(line, 1.0f, 0.8f, 0.1f, st.count ? (double)st.captured / st.count : 0.0);
         case ck::JobState::Keying:
-            std::snprintf(line, sizeof(line), "KEY '%s' IS KEYING %d%%", ck::safeKeyName(name).c_str(),
-                          (int)std::lround(st.progress * 100));
+            std::snprintf(line, sizeof(line), "KEY '%s' IS KEYING %d%%%s", ck::safeKeyName(name).c_str(),
+                          (int)std::lround(st.progress * 100),
+                          auto_->enabled() ? " - UPDATES BY ITSELF" : " - PRESS REFRESH NOW TO UPDATE");
             return show(line, 0.3f, 0.6f, 1.0f, st.progress);
         default:
             return show("KEY '" + ck::safeKeyName(name) + "' ISN'T AVAILABLE - PRESS KEY CLIP ON ITS NODE", 1.0f, 0.55f, 0.1f);
@@ -101,29 +119,10 @@ public:
 
     void changedParam(const OFX::InstanceChangedArgs&, const std::string& name) override {
         if (name != kPRefresh && name != kPKeyName) return;
+        RefreshState r;
         try {
-            ck::KeyRef ref = lookup();
-            std::string text;
-            std::string kn;
-            name_->getValue(kn);
-            if (!ref.valid()) {
-                text = ck::safeKeyName(kn).empty() ? "Type the key name shown on the CorridorKey 2.0 node."
-                                                   : "No key named '" + ck::safeKeyName(kn) + "' yet.";
-            } else {
-                ck::JobStatus st = ck::jobStatus(cachedCacheDir(), ref.id, true);
-                std::ostringstream o;
-                switch (st.state) {
-                case ck::JobState::Done:
-                    o << "✓ Using key '" << ck::safeKeyName(kn) << "': " << st.keyedCount << " frames, " << st.w
-                      << "×" << st.h;
-                    break;
-                case ck::JobState::Capturing: o << "Key is capturing frames (" << st.captured << "/" << st.count << ")."; break;
-                case ck::JobState::Keying: o << "Key is keying: " << (int)std::lround(st.progress * 100) << "%."; break;
-                default: o << "That key isn't available; press Key clip on its node."; break;
-                }
-                text = o.str();
-            }
-            status_->setValue(text);
+            r = refreshState();
+            status_->setValue(auto_->decorate(r));
         } catch (...) {
             plog("Pass node: status update failed (" + describeException() + ")");
         }
@@ -133,9 +132,51 @@ public:
             tick_->setValue(t + 1);
         } catch (...) {
         }
+        auto_->seen(r);
+        auto_->wake();
     }
 
 private:
+    static std::string viewSig(const ck::KeyRef& ref, const ck::JobStatus& st) {
+        if (!ref.valid()) return "nokey";
+        std::string v = ref.id + ":" + std::to_string((int)st.state);
+        if (st.state == ck::JobState::Keying) v += ":" + std::to_string((int)std::lround(st.progress * 100));
+        if (st.state == ck::JobState::Done) v += ":" + std::to_string(st.keyedCount);
+        return v;
+    }
+
+    RefreshState refreshState() {
+        RefreshState r;
+        std::string kn;
+        name_->getValue(kn);
+        ck::KeyRef ref = lookup();
+        if (!ref.valid()) {
+            r.status = ck::safeKeyName(kn).empty() ? "Type the key name shown on the CorridorKey 2.0 node."
+                                                   : "No key named '" + ck::safeKeyName(kn) + "' yet.";
+            r.stage = r.view = "nokey";
+            // A name is typed but no key has it yet: keep looking for it.
+            r.active = !ck::safeKeyName(kn).empty();
+            return r;
+        }
+        ck::JobStatus st = ck::jobStatus(cachedCacheDir(), ref.id, true);
+        std::ostringstream o;
+        switch (st.state) {
+        case ck::JobState::Done:
+            o << "✓ Using key '" << ck::safeKeyName(kn) << "': " << st.keyedCount << " frames, " << st.w << "×" << st.h;
+            break;
+        case ck::JobState::Capturing: o << "Key is capturing frames (" << st.captured << "/" << st.count << ")."; break;
+        case ck::JobState::Keying: o << "Key is keying: " << (int)std::lround(st.progress * 100) << "%."; break;
+        default: o << "That key isn't available; press Key clip on its node."; break;
+        }
+        r.status = o.str();
+        r.view = viewSig(ref, st);
+        r.stage = ref.id + ":" + std::to_string((int)st.state);
+        // Keep watching even when done: the CorridorKey node may key again under the same name.
+        r.active = true;
+        r.stamp = st.state == ck::JobState::Capturing || st.state == ck::JobState::Keying;
+        return r;
+    }
+
     ck::KeyRef lookup() {
         std::string name;
         name_->getValue(name);
@@ -146,6 +187,7 @@ private:
     OFX::StringParam *name_, *status_;
     OFX::ChoiceParam* pass_;
     OFX::IntParam* tick_;
+    std::unique_ptr<AutoRefresh> auto_;  // last: stopped before the rest goes away
 };
 
 mDeclarePluginFactory(CorridorKeyPassFactory, {}, {});
@@ -200,7 +242,9 @@ void CorridorKeyPassFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     page->addChild(*pass);
 
     OFX::PushButtonParamDescriptor* ref = desc.definePushButtonParam(kPRefresh);
-    ref->setLabel("Update status");
+    ref->setLabel("Refresh now");
+    ref->setHint("The status and the viewer update by themselves while the key runs. Press this if they "
+                 "ever seem stuck.");
     page->addChild(*ref);
 
     OFX::StringParamDescriptor* status = desc.defineStringParam(kPStatus);
@@ -224,6 +268,6 @@ OFX::ImageEffect* CorridorKeyPassFactory::createInstance(OfxImageEffectHandle h,
 }
 
 OFX::PluginFactory* makePassFactory() {
-    static CorridorKeyPassFactory p(kPassId, 1, 0);
+    static CorridorKeyPassFactory p(kPassId, 1, 1);
     return &p;
 }

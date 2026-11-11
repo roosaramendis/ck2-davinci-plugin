@@ -20,6 +20,7 @@ struct EngineConfig {
     std::string rotoScript;  // roto_daemon.py (default: next to ofx.conf)
     std::string pickerScript;  // roto_picker.py (default: next to ofx.conf)
     std::string samModel;    // default SAM 2.1 model for the Roto node
+    bool autoRefresh = true; // "auto_refresh=0": nodes don't update their Status/viewer by themselves
     bool ok = false;
     std::string error;
     std::string path;     // which file was read

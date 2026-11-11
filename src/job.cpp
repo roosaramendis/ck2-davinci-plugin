@@ -29,6 +29,54 @@ namespace ck {
 static const char* kRunner = R"PY(import os, shutil, signal, subprocess, sys, time
 job, cwd, cmd = sys.argv[1], sys.argv[2], sys.argv[4:]
 log = open(os.path.join(job, "engine.log"), "ab", buffering=0)
+def notify(job, ok):
+    # Desktop notification if the node asked for one (<job>/notify holds its name).
+    try:
+        with open(os.path.join(job, "notify"), encoding="utf-8") as f:
+            name = f.readline().strip() or "CorridorKey"
+    except OSError:
+        return
+    try:
+        if name == "CorridorKey Roto":
+            title = "CorridorKey Roto: tracking " + ("done" if ok else "failed")
+            body = ("Now press Key clip on the CorridorKey node." if ok
+                    else "See the Status line on the Roto node for details.")
+        else:
+            title = "CorridorKey: " + name + (" is keyed" if ok else " failed")
+            body = ("The key shows in Resolve by itself." if ok
+                    else "See the Status line on the CorridorKey node for details.")
+        env = {k: v for k, v in os.environ.items()
+               if not k.upper().startswith(("LD_", "QT_", "PYTHON", "DYLD_"))}
+        quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "env": env}
+        if sys.platform == "darwin":
+            q = lambda t: t.replace("\\", "\\\\").replace('"', '\\"')
+            subprocess.Popen(["osascript", "-e", 'display notification "%s" with title "%s"' % (q(body), q(title))],
+                             start_new_session=True, **quiet)
+        elif os.name == "nt":
+            env["CK2_TITLE"], env["CK2_BODY"] = title, body
+            ps = ("Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; "
+                  "$n = New-Object System.Windows.Forms.NotifyIcon; "
+                  "$n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; "
+                  "$n.ShowBalloonTip(15000, $env:CK2_TITLE, $env:CK2_BODY, 'Info'); "
+                  "Start-Sleep -Seconds 15; $n.Dispose()")
+            subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+                              "-Command", ps], creationflags=0x08000000, **quiet)
+        elif shutil.which("notify-send", path=env.get("PATH")):
+            subprocess.Popen(["notify-send", "-a", "CorridorKey", "-i", "dialog-information" if ok else "dialog-error",
+                              title, body], start_new_session=True, **quiet)
+        elif shutil.which("gdbus", path=env.get("PATH")):
+            import json
+            subprocess.Popen(["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                              "--object-path", "/org/freedesktop/Notifications",
+                              "--method", "org.freedesktop.Notifications.Notify", "CorridorKey", "0",
+                              "dialog-information", json.dumps(title), json.dumps(body), "[]", "{}", "15000"],
+                             start_new_session=True, **quiet)
+    except Exception as e:
+        try:
+            log.write(("[plugin] notification failed: %s\n" % e).encode())
+        except Exception:
+            pass
+
 kw = {"creationflags": 0x08000000 | 0x00000200} if os.name == "nt" else {"start_new_session": True}
 try:
     p = subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
@@ -73,6 +121,8 @@ for _ in range(50):  # Windows: the plugin may be reading it right now
         break
     except OSError:
         time.sleep(0.1)
+if code != "cancelled" and os.path.isdir(job):
+    notify(job, code == "0")
 )PY";
 
 static const char* kWindowSizes[] = {"", "80", "48", "24", "8", "1"};

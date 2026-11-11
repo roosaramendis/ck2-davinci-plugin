@@ -32,6 +32,7 @@ namespace fs = std::filesystem;
 #define kRInput "inputColor"
 #define kRData "rotoData"
 #define kRTick "refreshTick"
+#define kRNotify "notifyDone"
 
 enum RotoOut { eOverlay = 0, eHint, eGarbage, eRSource };
 static const char* kModels[][2] = {{"facebook/sam2.1-hiera-large", "SAM 2.1 Large – best edges"},
@@ -310,7 +311,21 @@ public:
         screen_ = fetchChoiceParam(kRScreen);
         model_ = fetchChoiceParam(kRModel);
         input_ = fetchChoiceParam(kRInput);
+        notify_ = fetchBooleanParam(kRNotify);
+        auto_ = std::make_unique<AutoRefresh>(
+            "Roto node", [this] { return refreshState(); },
+            [this](const std::string& text) {
+                std::string cur;
+                status_->getValue(cur);
+                if (cur != text) status_->setValue(text);
+            },
+            [this] {
+                int t = 0;
+                tick_->getValue(t);
+                tick_->setValue(t + 1);
+            });
     }
+    ~CorridorKeyRoto() override { auto_->stop(); }
 
     void getClipPreferences(OFX::ClipPreferencesSetter& prefs) override {
         prefs.setClipComponents(*dst_, OFX::ePixelComponentRGBA);
@@ -380,14 +395,26 @@ private:
     void pick(double time);
     void track();
     void refresh();
+    RefreshState refreshState();
+    std::string viewSig(const RotoData& r, const ck::JobStatus& st);
 
     OFX::Clip *dst_, *src_;
     OFX::StringParam *status_, *data_;
     OFX::IntParam *tick_, *grow_, *margin_;
     OFX::DoubleParam *soften_, *feather_;
     OFX::ChoiceParam *output_, *screen_, *model_, *input_;
+    OFX::BooleanParam* notify_;
     std::mutex mu_;
     std::string mem_;
+    // Pick character… only asks for the frame; the next render (where hosts hand out
+    // frames safely) saves it and opens the picker. Fetching it inside the button
+    // handler could hang Resolve on Windows (Fusion waits for itself).
+    std::mutex pickMu_;
+    std::string pickJob_;   // job id waiting for its frame ("" = none)
+    int pickIdx_ = -1;      // frame index in that job
+    std::string pickNote_;  // last problem saving it, for the Status line
+    bool pickFromRender(const RotoData& r, int idx, OFX::Image* src, bool fullRes);
+    std::unique_ptr<AutoRefresh> auto_;  // last: stopped before the rest goes away
 };
 
 bool CorridorKeyRoto::ensureJob(RotoData& r, std::string* err) {
@@ -436,45 +463,76 @@ void CorridorKeyRoto::pick(double time) {
         setStatus("✗ Tracking is running; press Stop first to change the selection.");
         return;
     }
-    std::unique_ptr<OFX::Image> img(src_->fetchImage(time));
-    std::vector<float> rgb;
-    int w = 0, h = 0;
-    OfxRectI b;
-    if (!img || !imageToBuffer(img.get(), 3, rgb, w, h, b)) {
-        setStatus("✗ Couldn't read this frame from the host.");
-        return;
-    }
     int idx = (int)std::lround(time - r.start);
     if (idx < 0 || idx >= r.count) {
         setStatus("✗ The playhead is outside the clip.");
         return;
     }
+    if (ck::pickerOpen(root(), r.id)) {
+        setStatus("The picker window is already open (it may be behind Resolve).");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(pickMu_);
+        pickJob_ = r.id;
+        pickIdx_ = idx;
+        pickNote_.clear();
+    }
+    plog("roto pick requested on frame " + std::to_string(idx) + " (waiting for the viewer to draw it)");
+    setStatus("Opening the picker on frame " + std::to_string(idx) + "… (the frame is taken when the viewer "
+              "draws it: show this node, or the CorridorKey node after it, in the viewer)");
+    bump();         // the host redraws: render() saves the frame and opens the picker
+    auto_->wake();  // follows it: the status changes by itself when the picker opens / closes
+}
+
+// Called from render(): saves the frame the picker asked for and opens the window.
+// True if this render handled a pending pick.
+bool CorridorKeyRoto::pickFromRender(const RotoData& r, int idx, OFX::Image* src, bool fullRes) {
+    {
+        std::lock_guard<std::mutex> lock(pickMu_);
+        if (pickJob_.empty() || pickJob_ != r.id || pickIdx_ != idx) return false;
+        if (!src) {
+            pickNote_ = "Connect the clip to this node's input first.";
+            pickJob_.clear();
+            return true;
+        }
+        if (!fullRes) {
+            pickNote_ = "The viewer is at reduced resolution (proxy): set it to full resolution, then press "
+                        "'Pick character…' again.";
+            pickJob_.clear();
+            return true;
+        }
+        pickJob_.clear();  // taken: other render threads leave it alone
+    }
+    auto fail = [&](const std::string& msg) {
+        plog("roto pick: " + msg);
+        std::lock_guard<std::mutex> lock(pickMu_);
+        pickNote_ = msg;
+        return true;
+    };
+    std::vector<float> rgb;
+    int w = 0, h = 0;
+    OfxRectI b;
+    if (!imageToBuffer(src, 3, rgb, w, h, b)) return fail("Couldn't read this frame from the host.");
     int lin = 0;
     input_->getValue(lin);
-    std::string pv = ck::previewDir(root(), r.id);
+    const std::string rr = root();
+    std::string pv = ck::previewDir(rr, r.id), err;
     ck::makeDirs(pv);
     char name[64];
     std::snprintf(name, sizeof(name), "src_%06d.exr", idx);  // for SAM 2 (full quality)
     std::string exr = ck::joinPath(pv, name);
-    if (!ck::writeExr(exr + ".tmp.exr", rgb.data(), w, h, 3, &err, false)) {
-        setStatus("✗ Couldn't save the frame: " + err);
-        return;
-    }
+    if (!ck::writeExr(exr + ".tmp.exr", rgb.data(), w, h, 3, &err, false)) return fail("Couldn't save the frame: " + err);
     std::error_code ec;
     fs::rename(exr + ".tmp.exr", exr, ec);
     std::snprintf(name, sizeof(name), "view_%06d.ppm", idx);  // for the picker window
-    if (!writePPM(ck::joinPath(pv, name), rgb, w, h, lin == 1)) {
-        setStatus("✗ Couldn't save the frame for the picker.");
-        return;
-    }
-    if (!ck::openPicker(root(), r.id, idx, modelName(), &err)) {
-        setStatus("✗ Couldn't open the picker: " + err);
-        return;
-    }
+    if (!writePPM(ck::joinPath(pv, name), rgb, w, h, lin == 1)) return fail("Couldn't save the frame for the picker.");
+    plog("roto pick: frame " + std::to_string(idx) + " saved (" + std::to_string(w) + "x" + std::to_string(h) +
+         "), starting the picker");
+    if (!ck::openPicker(rr, r.id, idx, modelName(), &err)) return fail("Couldn't open the picker: " + err);
     plog("roto picker opened on frame " + std::to_string(idx));
-    setStatus("Picker window open (frame " + std::to_string(idx) + "): click / drag on what to keep, "
-              "then 'Use this selection'. Then press 'Track clip'.");
-    bump();
+    auto_->wake();
+    return true;
 }
 
 void CorridorKeyRoto::track() {
@@ -497,25 +555,63 @@ void CorridorKeyRoto::track() {
     }
     plog(std::string("roto track ") + (ts == ck::TrackStart::Started ? "started" : "waiting for playback") + ": " +
          std::to_string(pr.objects) + " object(s) picked on frame " + std::to_string(pr.frame));
+    bool on = true;
+    try {
+        notify_->getValue(on);
+    } catch (...) {
+    }
+    setNotify(root(), r.id, "CorridorKey Roto", on);
     refresh();
 }
 
-void CorridorKeyRoto::refresh() {
+std::string CorridorKeyRoto::viewSig(const RotoData& r, const ck::JobStatus& st) {
+    if (!r.valid()) return "none";
+    std::string v = r.id + ":" + std::to_string((int)st.state);
+    if (st.state == ck::JobState::Keying)
+        v += st.cancelling ? ":stopping" : ":" + std::to_string((int)std::lround(st.progress * 100));
+    if (st.state == ck::JobState::Done) v += ":" + std::to_string(st.keyedFirst) + "+" + std::to_string(st.keyedCount);
+    if (st.state == ck::JobState::Capturing) {
+        ck::Prompts pr = ck::readPrompts(root(), r.id);
+        v += std::string(ck::trackWanted(root(), r.id) ? ":want" : "") + (ck::pickerOpen(root(), r.id) ? ":picker" : "") +
+             (pr.valid ? ":p" + std::to_string(pr.frame) + "x" + std::to_string(pr.objects) : "");
+    }
+    return v;
+}
+
+RefreshState CorridorKeyRoto::refreshState() {
+    RefreshState out;
     RotoData r = data();
     if (!r.valid()) {
-        setStatus("Go to a frame where the character is clear and press 'Pick character…'.");
-        bump();
-        return;
+        out.status = "Go to a frame where what you want to keep is clearly visible and press 'Pick character…'.";
+        out.stage = out.view = "none";
+        return out;
     }
     ck::JobStatus st = ck::jobStatus(root(), r.id, true);
     ck::Prompts pr = ck::readPrompts(root(), r.id);
+    const bool want = ck::trackWanted(root(), r.id), picker = ck::pickerOpen(root(), r.id);
+    std::string pickWait, pickNote;
+    {
+        std::lock_guard<std::mutex> lock(pickMu_);
+        if (pickJob_ == r.id && !picker)
+            pickWait = "Opening the picker on frame " + std::to_string(pickIdx_) +
+                       "… (the frame is taken when the viewer draws it: show this node, or the CorridorKey node "
+                       "after it, in the viewer)";
+        if (!picker) pickNote = pickNote_;
+    }
+    if (!pickWait.empty() || !pickNote.empty()) {
+        out.status = pickWait.empty() ? "✗ " + pickNote : pickWait;
+        out.stage = r.id + (pickWait.empty() ? ":picknote" : ":pickwait");
+        out.view = viewSig(r, st);
+        out.active = !pickWait.empty();
+        return out;
+    }
     std::ostringstream o;
     switch (st.state) {
     case ck::JobState::Capturing:
-        if (ck::trackWanted(root(), r.id))
+        if (want)
             o << "Captured " << st.captured << "/" << st.count << " frames: play the clip to the end (tracking starts "
               << "by itself, also when playback loops back), or press 'Track captured frames now'.";
-        else if (ck::pickerOpen(root(), r.id))
+        else if (picker)
             o << "Picker window is open: choose what to keep, then 'Use this selection'.";
         else if (pr.valid)
             o << pr.objects << " object(s) picked on frame " << pr.frame << ". Press 'Track clip'.";
@@ -538,10 +634,23 @@ void CorridorKeyRoto::refresh() {
         break;
     case ck::JobState::Failed: o << "✗ Tracking failed: " << st.message; break;
     case ck::JobState::Cancelled: o << "Stopped. Press 'Track clip' to try again."; break;
-    default: o << "Go to a frame where the character is clear and press 'Pick character…'."; break;
+    default: o << "Go to a frame where what you want to keep is clearly visible and press 'Pick character…'."; break;
     }
-    setStatus(o.str());
+    out.status = o.str();
+    out.view = viewSig(r, st);
+    out.stage = r.id + ":" + std::to_string((int)st.state) + (want ? ":want" : "") + (picker ? ":picker" : "") +
+                (pr.valid ? ":picked" : "") + (st.cancelling ? ":stopping" : "");
+    out.active = st.state == ck::JobState::Keying || (st.state == ck::JobState::Capturing && (want || picker));
+    out.stamp = out.active && out.status.rfind("\xe2\x9c\x97", 0) != 0;
+    return out;
+}
+
+void CorridorKeyRoto::refresh() {
+    RefreshState st = refreshState();
+    setStatus(auto_->decorate(st));
     bump();
+    auto_->seen(st);
+    auto_->wake();
 }
 
 void CorridorKeyRoto::changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) {
@@ -551,9 +660,25 @@ void CorridorKeyRoto::changedParam(const OFX::InstanceChangedArgs& args, const s
         reportBug(detectHost().text, "CorridorKey Roto", st);
         return;
     }
+    if (name == kRNotify) {
+        RotoData r = data();
+        bool on = true;
+        try {
+            notify_->getValue(on);
+        } catch (...) {
+        }
+        // Only matters once tracking was asked for (Track clip writes it again anyway).
+        if (r.valid() && ck::trackWanted(root(), r.id)) setNotify(root(), r.id, "CorridorKey Roto", on);
+        return;
+    }
     bool button = name == kRPick || name == kRTrack || name == kRTrackNow || name == kRStop || name == kRRefresh || name == kRForget;
     if (!button) return;
     if (name != kRRefresh) plog("roto button '" + name + "'");
+    if (name != kRPick && name != kRRefresh) {  // a waiting / failed pick no longer matters
+        std::lock_guard<std::mutex> lock(pickMu_);
+        pickJob_.clear();
+        pickNote_.clear();
+    }
     try {
         if (name == kRPick) pick(args.time);
         else if (name == kRTrack) track();
@@ -582,7 +707,7 @@ void CorridorKeyRoto::changedParam(const OFX::InstanceChangedArgs& args, const s
             RotoData r = data();
             if (r.valid()) ck::forgetJob(root(), r.id);
             setData("");
-            setStatus("Go to a frame where the character is clear and press 'Pick character…'.");
+            setStatus("Go to a frame where what you want to keep is clearly visible and press 'Pick character…'.");
         }
     } catch (...) {
         std::string why = describeException();
@@ -598,13 +723,16 @@ void CorridorKeyRoto::render(const OFX::RenderArguments& args) {
     int out = 0;
     output_->getValue(out);
     const OfxRectI rw = args.renderWindow;
-    if (out == eRSource) return copySource(dst.get(), src.get(), rw);
 
     RotoData r = data();
     const std::string rr = root();
-    ck::JobStatus st = r.valid() ? ck::jobStatus(rr, r.id) : ck::JobStatus{};
     const int idx = (int)std::lround(args.time - r.start);
     const bool fullRes = std::fabs(args.renderScale.x - 1.0) < 1e-6 && std::fabs(args.renderScale.y - 1.0) < 1e-6;
+    if (r.valid()) pickFromRender(r, idx, src.get(), fullRes);  // Pick character… waiting for this frame?
+    if (out == eRSource) return copySource(dst.get(), src.get(), rw);
+
+    ck::JobStatus st = r.valid() ? ck::jobStatus(rr, r.id) : ck::JobStatus{};
+    if (r.valid()) auto_->wake(viewSig(r, st));
 
     // Capture frames while the user plays the clip (after Track clip was pressed).
     if (r.valid() && st.state == ck::JobState::Capturing && ck::trackWanted(rr, r.id) && src && fullRes &&
@@ -640,7 +768,9 @@ void CorridorKeyRoto::render(const OFX::RenderArguments& args) {
             bn = {line, 1.0f, 0.8f, 0.1f, st.count ? (double)st.captured / st.count : 0.0};
         }
     } else if (st.state == ck::JobState::Keying) {
-        std::snprintf(line, sizeof(line), "ROTO: TRACKING %d%%", (int)std::lround(st.progress * 100));
+        std::snprintf(line, sizeof(line), auto_->enabled() ? "ROTO: TRACKING %d%% - UPDATES BY ITSELF"
+                                                           : "ROTO: TRACKING %d%% - PRESS REFRESH NOW TO UPDATE",
+                      (int)std::lround(st.progress * 100));
         bn = {line, 0.3f, 0.6f, 1.0f, st.progress};
     } else if (st.state == ck::JobState::Failed) {
         bn = {"ROTO: TRACKING FAILED - SEE STATUS", 1.0f, 0.25f, 0.25f};
@@ -751,7 +881,7 @@ void CorridorKeyRotoFactory::describe(OFX::ImageEffectDescriptor& desc) {
     desc.setLabels(kRotoName, kRotoName, kRotoName);
     desc.setPluginGrouping("Keying");
     desc.setPluginDescription(
-        "Pick a character with on-screen points; SAM 2.1 tracks it through the clip. Outputs a hint "
+        "Pick what to keep (people, props, areas) with clicks and rectangles; SAM 2.1 tracks it through the clip. Outputs a hint "
         "matte for CorridorKey 2.0's Hint input, or the source with everything else filled with screen colour.");
     desc.addSupportedContext(OFX::eContextFilter);
     desc.addSupportedContext(OFX::eContextGeneral);
@@ -783,17 +913,26 @@ void CorridorKeyRotoFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
         page->addChild(*b);
     };
     button(kRPick, "Pick character…", "Opens a window on this frame: click on what to keep, right-click on what "
-                                      "to remove, drag rectangles around characters. Live preview.");
+                                      "to remove, drag rectangles around objects or areas. Works on anything, not only characters. Live preview.");
     button(kRTrack, "Track clip", "Track the picked selection through the whole clip. Play the clip once to capture it.");
     button(kRTrackNow, "Track captured frames now",
            "Don't wait for the whole clip: track the frames captured so far around the picked frame.");
     button(kRStop, "Stop", "Stop tracking.");
-    button(kRRefresh, "Update status", "Refresh the status line and the viewer.");
+    button(kRRefresh, "Refresh now",
+           "The status and the viewer update by themselves while tracking runs. Press this if they ever seem stuck.");
+
+    OFX::BooleanParamDescriptor* nt = desc.defineBooleanParam(kRNotify);
+    nt->setLabel("Notify when done");
+    nt->setDefault(true);
+    nt->setAnimates(false);
+    nt->setEvaluateOnChange(false);
+    nt->setHint("Show a desktop notification when tracking finishes or fails.");
+    page->addChild(*nt);
 
     OFX::StringParamDescriptor* status = desc.defineStringParam(kRStatus);
     status->setLabel("Status");
     status->setStringType(OFX::eStringTypeSingleLine);
-    status->setDefault("Go to a frame where the character is clear and press 'Pick character…'.");
+    status->setDefault("Go to a frame where what you want to keep is clearly visible and press 'Pick character…'.");
     status->setAnimates(false);
     status->setEvaluateOnChange(false);
     page->addChild(*status);
@@ -886,6 +1025,6 @@ OFX::ImageEffect* CorridorKeyRotoFactory::createInstance(OfxImageEffectHandle h,
 }
 
 OFX::PluginFactory* makeRotoFactory() {
-    static CorridorKeyRotoFactory p(kRotoId, 1, 0);
+    static CorridorKeyRotoFactory p(kRotoId, 1, 1);
     return &p;
 }

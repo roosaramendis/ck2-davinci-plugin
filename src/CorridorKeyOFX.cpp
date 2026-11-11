@@ -43,7 +43,7 @@ namespace fs = std::filesystem;
     "Community plugin, not an official Corridor Digital product."
 #define kPluginIdentifier "io.github.ck2gui.CorridorKey2"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 1
+#define kPluginVersionMinor 2
 
 #define kHintClip "Hint"
 
@@ -69,6 +69,7 @@ namespace fs = std::filesystem;
 #define kKeyName "keyName"
 #define kReport "reportBug"
 #define kHintMode "hintMode"
+#define kNotify "notifyDone"
 
 static const char* kWindows[] = {"Auto (from free GPU memory)", "80/40 – steadiest, most memory", "48/24",
                                  "24/12", "8/4", "1/1 – single frames, least memory"};
@@ -85,7 +86,7 @@ static std::string statusText(const ck::JobStatus& st) {
     case ck::JobState::Keying:
         if (st.cancelling) return "Stopping…";
         o << "Keying in the background: " << (int)std::lround(st.progress * 100)
-          << "%. You can keep working. Press 'Update status' to refresh.";
+          << "%. You can keep working; the key appears by itself when it's done.";
         return o.str();
     case ck::JobState::Done:
         o << "✓ Keyed " << st.keyedCount << " frames at " << st.w << "×" << st.h << ".";
@@ -94,6 +95,16 @@ static std::string statusText(const ck::JobStatus& st) {
     case ck::JobState::Cancelled: return "Stopped. Press 'Key clip' to start again.";
     }
     return "";
+}
+
+// What the viewer shows for a job, independent of the frame: when it changes, the
+// node must be redrawn.
+static std::string viewSig(const std::string& id, const ck::JobStatus& st) {
+    std::string v = id + ":" + std::to_string((int)st.state);
+    if (st.state == ck::JobState::Keying)
+        v += st.cancelling ? ":stopping" : ":" + std::to_string((int)std::lround(st.progress * 100));
+    if (st.state == ck::JobState::Done) v += ":" + std::to_string(st.keyedFirst) + "+" + std::to_string(st.keyedCount);
+    return v;
 }
 
 // ============================================================ the effect
@@ -116,8 +127,22 @@ public:
         memory_ = fetchChoiceParam(kMemory);
         lowVram_ = fetchBooleanParam(kLowVram);
         exportDir_ = fetchStringParam(kExportDir);
+        notify_ = fetchBooleanParam(kNotify);
         plog("node created in " + detectHost().text + (hint_ ? " (Fusion/general: has Hint input)" : " (filter)"));
+        auto_ = std::make_unique<AutoRefresh>(
+            "CorridorKey node", [this] { return refreshState(); },
+            [this](const std::string& text) {
+                std::string cur;
+                status_->getValue(cur);
+                if (cur != text) status_->setValue(text);
+            },
+            [this] {
+                int t = 0;
+                tick_->getValue(t);
+                tick_->setValue(t + 1);
+            });
     }
+    ~CorridorKeyPlugin() override { auto_->stop(); }  // before the params go away
 
     void render(const OFX::RenderArguments& args) override;
     bool isIdentity(const OFX::IsIdentityArguments& args, OFX::Clip*& clip, double& time) override;
@@ -129,6 +154,8 @@ private:
     void keyNow();
     void stopKey();
     void refresh();
+    RefreshState refreshState();
+    void updateNotify();
     void forgetKey();
     void exportExr();
     // Param writes can be refused by a host; never let that abort a button.
@@ -181,7 +208,8 @@ private:
     OFX::IntParam* tick_;
     OFX::ChoiceParam *output_, *inputColor_, *memory_;
     OFX::DoubleParam *hintQ_, *despill_;
-    OFX::BooleanParam* lowVram_;
+    OFX::BooleanParam *lowVram_, *notify_;
+    std::unique_ptr<AutoRefresh> auto_;  // last: stopped before the rest goes away
 };
 
 void CorridorKeyPlugin::getClipPreferences(OFX::ClipPreferencesSetter& prefs) {
@@ -237,6 +265,7 @@ void CorridorKeyPlugin::render(const OFX::RenderArguments& args) {
     const std::string cache = cachedCacheDir();
     const ck::JobStatus st = ck::jobStatus(cache, k.id);
     const int idx = (int)std::lround(args.time - k.start);
+    auto_->wake(viewSig(k.id, st));
     {
         static std::mutex* mu = new std::mutex;
         static auto* seen = new std::map<std::string, int>;
@@ -271,7 +300,10 @@ void CorridorKeyPlugin::render(const OFX::RenderArguments& args) {
             }
             break;
         case ck::JobState::Keying:
-            std::snprintf(line, sizeof(line), st.cancelling ? "STOPPING..." : "KEYING %d%% (BACKGROUND)",
+            std::snprintf(line, sizeof(line),
+                          st.cancelling ? "STOPPING..."
+                          : auto_->enabled() ? "KEYING %d%% (BACKGROUND) - UPDATES BY ITSELF"
+                                             : "KEYING %d%% (BACKGROUND) - PRESS REFRESH NOW TO UPDATE",
                           (int)std::lround(st.progress * 100));
             bn = {line, 0.3f, 0.6f, 1.0f, st.progress};
             break;
@@ -308,12 +340,13 @@ void CorridorKeyPlugin::render(const OFX::RenderArguments& args) {
 void CorridorKeyPlugin::changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) {
     // No check of args.reason: Resolve's Fusion page doesn't report button presses
     // as "user edits", and buttons can only be pressed by the user anyway.
-    if (name == kKeyName) {
+    if (name == kKeyName || name == kNotify) {
         try {
             KeyData k = keyData();
-            if (k.valid()) publishName(k);
+            if (k.valid() && name == kKeyName) publishName(k);
+            updateNotify();
         } catch (...) {
-            plog("key name change failed: " + describeException());
+            plog(name + " change failed: " + describeException());
         }
         return;
     }
@@ -357,15 +390,43 @@ void CorridorKeyPlugin::publishName(const KeyData& k) {
         plog("key " + k.id + " published as '" + ck::safeKeyName(name) + "'");
 }
 
-void CorridorKeyPlugin::refresh() {
+RefreshState CorridorKeyPlugin::refreshState() {
+    RefreshState r;
     KeyData k = keyData();
-    if (k.valid()) {
-        ck::JobStatus st = ck::jobStatus(cachedCacheDir(), k.id, true);
-        setStatus(statusText(st));
-    } else {
-        setStatus("Not keyed yet. Press 'Key clip'.");
+    if (!k.valid()) {
+        r.status = "Not keyed yet. Press 'Key clip'.";
+        r.stage = r.view = "none";
+        return r;
     }
+    ck::JobStatus st = ck::jobStatus(cachedCacheDir(), k.id, true);
+    r.status = statusText(st);
+    r.view = viewSig(k.id, st);
+    r.stage = k.id + ":" + std::to_string((int)st.state) + (st.cancelling ? ":stopping" : "");
+    r.active = st.state == ck::JobState::Capturing || st.state == ck::JobState::Keying;
+    r.stamp = r.active;
+    return r;
+}
+
+void CorridorKeyPlugin::refresh() {
+    RefreshState r = refreshState();
+    setStatus(auto_->decorate(r));
     bumpTick();
+    auto_->seen(r);
+    auto_->wake();
+}
+
+// Desktop notification when this node's key finishes (or fails).
+void CorridorKeyPlugin::updateNotify() {
+    KeyData k = keyData();
+    if (!k.valid()) return;
+    bool on = true;
+    std::string name;
+    try {
+        notify_->getValue(on);
+        keyName_->getValue(name);
+    } catch (...) {
+    }
+    setNotify(cachedCacheDir(), k.id, ck::safeKeyName(name).empty() ? "key-" + k.id.substr(0, 4) : ck::safeKeyName(name), on);
 }
 
 void CorridorKeyPlugin::forgetKey() {
@@ -452,7 +513,8 @@ void CorridorKeyPlugin::keyClip() {
     plog("job " + k.id + " created: " + std::to_string(n) + " frames, cache " + cfg.cacheDir);
     setKeyData(k.str());  // host re-renders: capturing starts with this frame
     publishName(k);
-    setStatus(statusText(ck::jobStatus(cfg.cacheDir, k.id, true)));
+    updateNotify();
+    refresh();
 }
 
 void CorridorKeyPlugin::keyNow() {
@@ -577,8 +639,9 @@ void CorridorKeyPluginFactory::describeInContext(OFX::ImageEffectDescriptor& des
     page->addChild(*stop);
 
     OFX::PushButtonParamDescriptor* ref = desc.definePushButtonParam(kRefresh);
-    ref->setLabel("Update status");
-    ref->setHint("Refresh the status line and redraw the viewer.");
+    ref->setLabel("Refresh now");
+    ref->setHint("The status and the viewer update by themselves while a key runs. Press this if they "
+                 "ever seem stuck.");
     page->addChild(*ref);
 
     OFX::StringParamDescriptor* status = desc.defineStringParam(kStatus);
@@ -667,6 +730,15 @@ void CorridorKeyPluginFactory::describeInContext(OFX::ImageEffectDescriptor& des
     lv->setEvaluateOnChange(false);
     lv->setHint("Only with a manual window. Uses disk instead of GPU memory (slower).");
     page->addChild(*lv);
+
+    OFX::BooleanParamDescriptor* nt = desc.defineBooleanParam(kNotify);
+    nt->setLabel("Notify when done");
+    nt->setDefault(true);
+    nt->setAnimates(false);
+    nt->setEvaluateOnChange(false);
+    nt->setHint("Show a desktop notification when keying finishes or fails (even if Resolve is minimised "
+                "or closed).");
+    page->addChild(*nt);
 
     OFX::PushButtonParamDescriptor* forget = desc.definePushButtonParam(kForget);
     forget->setLabel("Forget key");

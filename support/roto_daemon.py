@@ -218,6 +218,46 @@ def build_sam_frames(job: Path, first: int, count: int):
     return info
 
 
+def notify(job: Path, ok: bool):
+    """Desktop notification when tracking ends, if the node asked for one (<job>/notify)."""
+    import shutil
+    import subprocess
+    if not (job / "notify").exists():
+        return
+    title = "CorridorKey Roto: tracking " + ("done" if ok else "failed")
+    body = ("Now press Key clip on the CorridorKey node." if ok
+            else "See the Status line on the Roto node for details.")
+    try:
+        env = {k: v for k, v in os.environ.items()
+               if not k.upper().startswith(("LD_", "QT_", "PYTHON", "DYLD_"))}
+        quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "env": env}
+        if sys.platform == "darwin":
+            def q(t):
+                return t.replace("\\", "\\\\").replace('"', '\\"')
+            subprocess.Popen(["osascript", "-e", 'display notification "%s" with title "%s"' % (q(body), q(title))],
+                             start_new_session=True, **quiet)
+        elif os.name == "nt":
+            env["CK2_TITLE"], env["CK2_BODY"] = title, body
+            ps = ("Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; "
+                  "$n = New-Object System.Windows.Forms.NotifyIcon; "
+                  "$n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; "
+                  "$n.ShowBalloonTip(15000, $env:CK2_TITLE, $env:CK2_BODY, 'Info'); "
+                  "Start-Sleep -Seconds 15; $n.Dispose()")
+            subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+                              "-Command", ps], creationflags=0x08000000, **quiet)
+        elif shutil.which("notify-send", path=env.get("PATH")):
+            subprocess.Popen(["notify-send", "-a", "CorridorKey", "-i", "dialog-information" if ok else "dialog-error",
+                              title, body], start_new_session=True, **quiet)
+        elif shutil.which("gdbus", path=env.get("PATH")):
+            subprocess.Popen(["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                              "--object-path", "/org/freedesktop/Notifications",
+                              "--method", "org.freedesktop.Notifications.Notify", "CorridorKey", "0",
+                              "dialog-information", json.dumps(title), json.dumps(body), "[]", "{}", "15000"],
+                             start_new_session=True, **quiet)
+    except Exception as e:
+        log(job, f"[roto] notification failed: {e}")
+
+
 def do_track(sam: Sam, job: Path, req: dict):
     from PIL import Image
     code = "1"
@@ -260,6 +300,8 @@ def do_track(sam: Sam, job: Path, req: dict):
     if job.is_dir():
         atomic_write(job / "track_done.json", json.dumps({"seq": req["seq"]}))
         atomic_write(job / "exitcode", code)
+        if code != "cancelled":
+            notify(job, code == "0")
 
 
 def single_instance():

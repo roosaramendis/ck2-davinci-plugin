@@ -16,7 +16,7 @@ playback and scrubbing are instant.
 | **CorridorKey 2.0** | Keys the clip (in the background) and outputs one pass: cutout, matte, foreground or checker. |
 | **CorridorKey Pass** | Outputs one pass of a key, found by its **Key name**. Use several to get several passes at once; nothing is keyed twice. |
 | **CorridorKey Outputs** (Fusion macro) | One node with **Cutout / Alpha / Foreground / Checker** outputs, built from four Pass nodes. Fusion page only. |
-| **CorridorKey Roto** | Click-to-track roto with SAM 2.1: click / drag rectangles on the characters in a picker window, it tracks them through the clip and outputs a **hint matte** for CorridorKey's Hint input, or the **source with everything else filled with screen colour**. |
+| **CorridorKey Roto** | Click-to-track roto with SAM 2.1: click / drag rectangles on whatever you want to keep (people, props, areas) in a picker window, it tracks them through the clip and outputs a **hint matte** for CorridorKey's Hint input, or the **source with everything else filled with screen colour**. |
 
 An OpenFX node can only have one output, so several passes come from Pass nodes
 (or the macro, which bundles them).
@@ -91,9 +91,10 @@ as an update.
    key the frames saved so far.
 4. When every frame is saved, keying starts by itself in the background. The
    viewer shows `KEYING 45%`. You can keep working, or even close Resolve; it
-   finishes anyway. **Stop keying** cancels it, and **Update status** refreshes
-   the status line and the viewer.
-5. When it's done, the key appears in place of the source. Pick what the node
+   finishes anyway. The Status line and the viewer update by themselves while
+   it runs, and you get a desktop notification when it's done (turn that off
+   with **Notify when done**). **Stop keying** cancels it.
+5. When it's done, the key appears in place of the source by itself. Pick what the node
    outputs:
    - **Cutout:** despilled colour plus alpha. This is the normal choice.
    - **Matte:** the alpha as a black-and-white image.
@@ -102,7 +103,7 @@ as an update.
    - **Source:** bypass.
 
 If a frame still shows the `KEYING` banner after keying is done, press
-**Update status**. `KEY MISSING` means the cached key is gone, for example after
+**Refresh now** (see "If the status doesn't update by itself" below). `KEY MISSING` means the cached key is gone, for example after
 moving the project to another computer or clearing the cache. Key again.
 
 ### Several passes at once
@@ -114,16 +115,21 @@ rename it.
 - **Fusion page:** *Add Tool → Macros → CorridorKey Outputs*, then type the key
   name once. The node has Cutout, Alpha, Foreground and Checker outputs.
 
-### Keep only one character: CorridorKey Roto
+### Keep only what you want: CorridorKey Roto
+
+Use it to keep anything in the shot (people, props, a car, a whole area) and
+drop the rest.
 
 1. Wire it up. The clip goes into **both** nodes: MediaIn → **CorridorKey Roto**,
    and MediaIn → **CorridorKey 2.0**. The Roto output goes into CorridorKey's
    **Hint** input (the second, green triangle).
-2. Go to a frame where the character is clear and press **Pick character…**. A
-   window opens on that frame:
-   - **click** on the character to keep it,
-   - **right-click** on things to remove (another person, a light stand),
-   - **drag** a rectangle around a character or area; each rectangle is its own
+2. Go to a frame where what you want to keep is clearly visible and press
+   **Pick character…** (it works for any object, not only characters). A
+   window opens on that frame. The frame is taken when the viewer draws it, so
+   the Roto node (or the CorridorKey node after it) must be in the viewer:
+   - **click** on something to keep it,
+   - **right-click** on things to remove (a light stand, a crew member, a rig),
+   - **drag** a rectangle around an object or area; each rectangle is its own
      object, so add as many as you need,
    - wheel zooms, middle-drag pans, Ctrl+Z undoes.
 
@@ -137,10 +143,10 @@ rename it.
    doesn't need another playback.
 4. **Output** (default **Hint matte**). **Overlay** shows the mask over the
    picture to check it. **Garbage-filled source** fills everything outside the
-   character with screen colour; use it on the Edit/Color page, where there's no
+   picked objects with screen colour; use it on the Edit/Color page, where there's no
    Hint input, by putting CorridorKey 2.0 *after* the Roto node.
-5. Wait for **✓ Tracked** in the Roto status, *then* press Key clip on the
-   CorridorKey node.
+5. Wait for **✓ Tracked** in the Roto status (it updates by itself, and you
+   get a desktop notification), *then* press Key clip on the CorridorKey node.
 
 With a Hint connected, **Hint is: First frame only** gives CorridorKey just the
 first frame's matte and lets it carry it forward.
@@ -170,6 +176,20 @@ The plugin detects the edition by itself and shows it under **Edition**
 (Resolve reports itself as "DaVinci Resolve Lite" for Free). Everything
 currently works in both. If a future feature needs Studio, its button will say
 so in Free instead of failing.
+
+### If the status doesn't update by itself
+
+Each node checks its background job every 2 seconds while one runs, and asks
+Resolve to redraw when something changes. OpenFX doesn't guarantee that a host
+accepts this, so:
+
+- **Refresh now** on every node updates the Status line and the viewer by hand.
+- If Resolve refuses an automatic update, that node switches to manual updates
+  by itself (the Status line then says "press 'Refresh now' to update", and
+  `plugin.log` says why).
+- To switch automatic updates off everywhere, add a line `auto_refresh=0` to
+  the config file (see the table under Install) and restart Resolve. The
+  desktop notifications still work.
 
 ## Where things are kept
 

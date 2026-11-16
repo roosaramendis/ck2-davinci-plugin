@@ -249,6 +249,7 @@ struct RefreshState {
     std::string view;    // a change here redraws the viewer
     bool active = false; // a job is running / waiting: keep checking
     bool stamp = false;  // add "(updated 14:03:21)" to the Status line
+    bool pump = false;   // reading frames by itself: ask for the next redraw as soon as one is done
 };
 
 class AutoRefresh {
@@ -275,7 +276,10 @@ public:
         if (!enabled()) return;
         std::lock_guard<std::mutex> lock(s_->mu);
         if (s_->quit) return;
-        if (!drawn.empty()) s_->drawn = drawn;
+        if (!drawn.empty()) {
+            s_->drawn = drawn;
+            ++s_->renders;
+        }
         s_->woken = true;
         if (!started_) {
             started_ = true;
@@ -332,7 +336,8 @@ private:
         bool quit = false, woken = false, busy = false;
         std::atomic<bool> refused{false};
         std::string stage, status, drawn, bumped;
-        std::chrono::steady_clock::time_point lastStatus{};
+        std::chrono::steady_clock::time_point lastStatus{}, lastPump{};
+        long long renders = 0, pumped = -1;
     };
 
     // Runs `f` outside the lock (it may call the host). False = node closing.
@@ -369,6 +374,9 @@ private:
             if (ok) {
                 auto now = clock::now();
                 bool redraw = !st.view.empty() && st.view != s.drawn && st.view != s.bumped;
+                // Pump: one redraw per finished render (each render reads the next frames). If the
+                // host didn't render (node not in the viewer), ask again every few seconds.
+                bool pump = st.pump && (s.renders != s.pumped || now - s.lastPump >= std::chrono::seconds(3));
                 bool text = !st.status.empty() &&
                             (st.stage != s.stage || (st.status != s.status && now - s.lastStatus >= std::chrono::seconds(5)) ||
                              (st.stamp && now - s.lastStatus >= std::chrono::seconds(30)));
@@ -390,9 +398,16 @@ private:
                         s.lastStatus = now;
                     }
                 }
-                if (redraw && !s.refused) {
+                if ((redraw || pump) && !s.refused) {
+                    long long renders = s.renders;
                     if (!outside(s, lock, [&] { guarded([&] { s.redraw(); }); })) break;
-                    if (!s.refused) s.bumped = st.view;
+                    if (!s.refused) {
+                        if (redraw) s.bumped = st.view;
+                        if (pump) {
+                            s.pumped = renders;
+                            s.lastPump = clock::now();
+                        }
+                    }
                 }
                 if (s.refused) {
                     plog(s.who + ": the host refused an automatic update (" + why +
@@ -408,7 +423,10 @@ private:
                     break;
                 }
             }
-            if (ok && st.active) {
+            if (ok && st.pump) {
+                // Next redraw as soon as the host has rendered (it wakes us), else re-check soon.
+                s.cv.wait_for(lock, std::chrono::milliseconds(150), [&] { return s.quit || s.renders != s.pumped; });
+            } else if (ok && st.active) {
                 s.cv.wait_for(lock, std::chrono::seconds(2), [&] { return s.quit; });
             } else {
                 // Nothing running: sleep until the next render / button (at most one check per second).

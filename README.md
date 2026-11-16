@@ -66,6 +66,11 @@ Compiling (`--build`, or a source checkout without `prebuilt/`) needs `cmake`,
 Press **Report a bug** on the CorridorKey node (or in the ck2-gui app). It opens a
 GitHub issue with the latest log lines filled in, plus the log folder.
 
+### Publishing a release (maintainer)
+
+Push a tag like `v1.0.0`. GitHub Actions builds the plugin for Linux, Windows and
+macOS and publishes `ck2-davinci-plugin-v1.0.0.zip`, which ck2-gui then offers
+as an update.
 
 ## Use
 
@@ -79,11 +84,17 @@ GitHub issue with the latest log lines filled in, plus the log folder.
      CorridorKey what to keep.
 2. Press **Key clip** in the Inspector. It returns at once, and Resolve never
    freezes.
-3. **Play the clip once from start to end.** The viewer shows
-   `CAPTURING 120/344` while each frame is saved. Playback needs full resolution
-   (proxy off). If Resolve drops frames, play it again; it only picks up the
-   missing ones. Not keying the whole clip? Press **Key captured frames now** to
-   key the frames saved so far.
+3. **Wait while it reads the clip.** You don't need to play anything: the node
+   reads the clip's frames by itself, a batch at a time, and the viewer shows
+   `READING FRAMES 120/344`. This node (or one after it) must be in the viewer,
+   at full resolution (proxy off). Resolve stays usable meanwhile; a slow node
+   before it (like a denoise) makes this take longer. Only the frames that play
+   in the edit are read. Not keying the whole clip? Press **Key captured frames
+   now** to key the frames saved so far.
+
+   If the banner says `CAPTURING … - PLAY THE CLIP ONCE` instead, Resolve
+   didn't hand out the frames by itself: play the clip once from start to end
+   (if it drops frames, play it again; only the missing ones are picked up).
 4. When every frame is saved, keying starts by itself in the background. The
    viewer shows `KEYING 45%`. You can keep working, or even close Resolve; it
    finishes anyway. The Status line and the viewer update by themselves while
@@ -130,12 +141,13 @@ drop the rest.
 
    After each change the mask is shown in red after a moment; the first time
    takes longer while SAM 2 loads. Press **Use this selection** when it's right.
-3. Press **Track clip**, then **play the clip once**. It only needs the frames
-   that actually play (a clip cut shorter in the edit is fine). If it ever waits
-   for more, let playback loop back to the start, or press **Track captured
-   frames now**. Tracking then runs in the
-   background (`ROTO: TRACKING 40%`). If you pick again later, Track clip
-   doesn't need another playback.
+3. Press **Track clip**. The node reads the clip's frames by itself (keep it, or
+   the CorridorKey node after it, in the viewer), then tracking runs in the
+   background (`ROTO: TRACKING 40%`). It only needs the frames that actually
+   play (a clip cut shorter in the edit is fine). If the banner asks you to
+   play the clip instead, play it once; if it waits for more, let playback loop
+   back to the start, or press **Track captured frames now**. If you pick again
+   later, Track clip doesn't need to read the frames again.
 4. **Output** (default **Hint matte**). **Overlay** shows the mask over the
    picture to check it. **Garbage-filled source** fills everything outside the
    picked objects with screen colour; use it on the Edit/Color page, where there's no
@@ -155,6 +167,11 @@ first frame's matte and lets it carry it forward.
 - **Hint trust:** how strictly the Hint matte is followed (Fusion only).
 - **Temporal window:** Auto picks from free GPU memory. Smaller windows use
   less memory. **Low-VRAM mode** trades speed for memory.
+- **Use shared GPU memory** (on by default): when the GPU's own memory is
+  full, keying keeps going in shared GPU memory (system RAM). That's slower but
+  it doesn't stop. Turn it off to keep everything in the GPU's own memory: if
+  that runs out, keying tries once more by itself with Low-VRAM mode and a
+  smaller window.
 
 ### Getting the result out of Resolve
 

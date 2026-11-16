@@ -23,6 +23,7 @@ struct JobSpec {
     bool hint = false;          // a Hint clip is connected
     bool hintFirstOnly = false; // use only the first frame of the hint (engine carries it forward)
     bool lowVram = false;
+    bool sharedVram = true;  // may spill into shared GPU memory (system RAM)
     int window = 0;             // 0 = auto, else hann chunk size
     double despill = 0.5, hintQ = 0.95, fps = 24.0;
     std::string str() const;
@@ -51,6 +52,7 @@ JobStatus jobStatus(const std::string& cacheDir, const std::string& id, bool fre
 bool captureFrame(const std::string& cacheDir, const std::string& id, int idx,
                   std::vector<float>&& rgb, int w, int h, int x1, int y1, std::vector<float>&& hint);
 bool frameCaptured(const std::string& cacheDir, const std::string& id, int idx);  // or being written
+bool captureQueueFull();  // the writers are behind: stop reading more frames for now
 // Tell the job which frame the host is drawing while capturing. When playback
 // jumps from the end of the captured frames back to their start (it looped),
 // the job starts on those frames even if the host reported a longer clip.

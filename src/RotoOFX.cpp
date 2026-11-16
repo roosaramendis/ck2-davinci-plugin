@@ -414,6 +414,11 @@ private:
     int pickIdx_ = -1;      // frame index in that job
     std::string pickNote_;  // last problem saving it, for the Status line
     bool pickFromRender(const RotoData& r, int idx, OFX::Image* src, bool fullRes);
+    // Automatic capture after Track clip: each render reads the next frames (see CorridorKey node).
+    void captureMore(const RotoData& r);
+    bool autoCapture() const { return auto_->enabled() && !autoCapFailed_; }
+    std::mutex autoMu_;
+    std::atomic<bool> autoCapFailed_{false};
     std::unique_ptr<AutoRefresh> auto_;  // last: stopped before the rest goes away
 };
 
@@ -608,7 +613,10 @@ RefreshState CorridorKeyRoto::refreshState() {
     std::ostringstream o;
     switch (st.state) {
     case ck::JobState::Capturing:
-        if (want)
+        if (want && autoCapture())
+            o << "Reading the clip's frames: " << st.captured << " of " << st.count << ". Tracking starts by itself "
+              << "when they're all in. (This node, or one after it, must be in the viewer at full resolution.)";
+        else if (want)
             o << "Captured " << st.captured << "/" << st.count << " frames: play the clip to the end (tracking starts "
               << "by itself, also when playback loops back), or press 'Track captured frames now'.";
         else if (picker)
@@ -641,6 +649,8 @@ RefreshState CorridorKeyRoto::refreshState() {
     out.stage = r.id + ":" + std::to_string((int)st.state) + (want ? ":want" : "") + (picker ? ":picker" : "") +
                 (pr.valid ? ":picked" : "") + (st.cancelling ? ":stopping" : "");
     out.active = st.state == ck::JobState::Keying || (st.state == ck::JobState::Capturing && (want || picker));
+    out.pump = st.state == ck::JobState::Capturing && want && autoCapture();
+    if (out.pump) out.stage += ":auto";
     out.stamp = out.active && out.status.rfind("\xe2\x9c\x97", 0) != 0;
     return out;
 }
@@ -716,6 +726,35 @@ void CorridorKeyRoto::changedParam(const OFX::InstanceChangedArgs& args, const s
     }
 }
 
+void CorridorKeyRoto::captureMore(const RotoData& r) {
+    if (!autoCapture()) return;
+    std::unique_lock<std::mutex> lock(autoMu_, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    const std::string rr = root();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < r.count; ++i) {
+        if (ck::frameCaptured(rr, r.id, i)) continue;
+        if (ck::captureQueueFull() || abort()) break;
+        std::unique_ptr<OFX::Image> img;
+        try {
+            img.reset(src_->fetchImage(r.start + i));
+        } catch (...) {
+        }
+        if (!img) {
+            autoCapFailed_ = true;
+            plog("roto " + r.id + ": the host didn't hand out frame " + std::to_string(i) +
+                 "; automatic capture is off for this node, play the clip instead");
+            return;
+        }
+        std::vector<float> rgb, none;
+        int w = 0, h = 0;
+        OfxRectI b;
+        if (imageToBuffer(img.get(), 3, rgb, w, h, b))
+            ck::captureFrame(rr, r.id, i, std::move(rgb), w, h, b.x1, b.y1, std::move(none));
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(400)) break;
+    }
+}
+
 void CorridorKeyRoto::render(const OFX::RenderArguments& args) {
     std::unique_ptr<OFX::Image> dst(dst_->fetchImage(args.time));
     if (!dst) OFX::throwSuiteStatusException(kOfxStatFailed);
@@ -745,6 +784,7 @@ void CorridorKeyRoto::render(const OFX::RenderArguments& args) {
                 ck::captureFrame(rr, r.id, idx, std::move(rgb), w, h, b.x1, b.y1, std::move(none));
         }
         if (ck::notePlayback(rr, r.id, idx)) plog("roto " + r.id + ": playback looped, tracking the captured frames");
+        captureMore(r);
     }
 
     // Which mask applies to this frame?
@@ -763,7 +803,9 @@ void CorridorKeyRoto::render(const OFX::RenderArguments& args) {
     } else if (st.state == ck::JobState::Capturing && ck::trackWanted(rr, r.id)) {
         if (!fullRes) bn = {"ROTO: SET PLAYBACK TO FULL RESOLUTION TO CAPTURE", 1.0f, 0.75f, 0.1f};
         else {
-            std::snprintf(line, sizeof(line), "ROTO: CAPTURING %d/%d - PLAY THE CLIP",
+            std::snprintf(line, sizeof(line),
+                          autoCapture() ? "ROTO: READING FRAMES %d/%d - TRACKING STARTS BY ITSELF"
+                                        : "ROTO: CAPTURING %d/%d - PLAY THE CLIP",
                           std::min(st.captured + 1, st.count), st.count);
             bn = {line, 1.0f, 0.8f, 0.1f, st.count ? (double)st.captured / st.count : 0.0};
         }
@@ -892,7 +934,7 @@ void CorridorKeyRotoFactory::describe(OFX::ImageEffectDescriptor& desc) {
     desc.setHostFrameThreading(false);
     desc.setSupportsMultiResolution(true);
     desc.setSupportsTiles(false);
-    desc.setTemporalClipAccess(false);
+    desc.setTemporalClipAccess(true);  // automatic capture reads the clip's other frames
     desc.setRenderThreadSafety(OFX::eRenderFullySafe);
 }
 
@@ -901,6 +943,7 @@ void CorridorKeyRotoFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     src->addSupportedComponent(OFX::ePixelComponentRGBA);
     src->addSupportedComponent(OFX::ePixelComponentRGB);
     src->setSupportsTiles(false);
+    src->setTemporalClipAccess(true);
     OFX::ClipDescriptor* dst = desc.defineClip(kOfxImageEffectOutputClipName);
     dst->addSupportedComponent(OFX::ePixelComponentRGBA);
     dst->setSupportsTiles(false);
@@ -1025,6 +1068,6 @@ OFX::ImageEffect* CorridorKeyRotoFactory::createInstance(OfxImageEffectHandle h,
 }
 
 OFX::PluginFactory* makeRotoFactory() {
-    static CorridorKeyRotoFactory p(kRotoId, 1, 1);
+    static CorridorKeyRotoFactory p(kRotoId, 1, 2);
     return &p;
 }

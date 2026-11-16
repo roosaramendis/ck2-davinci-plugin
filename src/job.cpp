@@ -77,14 +77,39 @@ def notify(job, ok):
         except Exception:
             pass
 
+HOOK = r"""
+# CorridorKey: keep PyTorch inside the GPU's own memory (no spill into shared GPU memory).
+import os
+if os.environ.get("CK2_NO_SHARED_VRAM") == "1":
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                free, total = torch.cuda.mem_get_info(i)
+                frac = max(0.05, min(0.98, (free - (256 << 20)) / total))
+                torch.cuda.set_per_process_memory_fraction(frac, i)
+                print("[ck2] shared GPU memory off: GPU %d limited to %.1f of %.1f GB"
+                      % (i, frac * total / 2**30, total / 2**30), flush=True)
+    except Exception as e:
+        print("[ck2] couldn't limit GPU memory: %s" % e, flush=True)
+"""
+no_shared = os.environ.get("CK2_NO_SHARED_VRAM") == "1"
+env = dict(os.environ)
+if no_shared:  # Python runs sitecustomize.py from PYTHONPATH before the engine starts
+    hook = os.path.join(job, "vramhook")
+    os.makedirs(hook, exist_ok=True)
+    with open(os.path.join(hook, "sitecustomize.py"), "w") as f:
+        f.write(HOOK)
+    env["PYTHONPATH"] = hook + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
 kw = {"creationflags": 0x08000000 | 0x00000200} if os.name == "nt" else {"start_new_session": True}
-try:
-    p = subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
-                         stdin=subprocess.DEVNULL, **kw)
-except OSError as e:
-    log.write(("could not start the engine: %s\n" % e).encode())
-    code = "start"
-else:
+
+def run(cmd):
+    try:
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, env=env, **kw)
+    except OSError as e:
+        log.write(("could not start the engine: %s\n" % e).encode())
+        return "start"
     cancelled = False
     while p.poll() is None:
         if not cancelled and (os.path.exists(os.path.join(job, "cancel")) or not os.path.isdir(job)):
@@ -111,8 +136,49 @@ else:
                 except Exception:
                     pass
         time.sleep(0.5)
-    code = "cancelled" if cancelled else str(p.wait())
+    return "cancelled" if cancelled else str(p.wait())
+
+def log_since(pos):
+    try:
+        with open(os.path.join(job, "engine.log"), "rb") as f:
+            f.seek(pos)
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+def smaller(cmd, text):
+    # Out of GPU memory: the same run with Low-VRAM mode and the next smaller window.
+    import re
+    if "--hann_chunk" in cmd:
+        used = int(cmd[cmd.index("--hann_chunk") + 1])
+    else:
+        m = re.findall(r"hann_chunk=(\d+)", text)
+        used = int(m[-1]) if m else None
+    if used == 1:
+        return None, 0
+    chunk = 24 if not used else next((c for c in (80, 48, 24, 8, 1) if c < used), 1)
+    out, skip = [], 0
+    for a in cmd:
+        if skip:
+            skip -= 1
+        elif a in ("--hann_chunk", "--hann_stride"):
+            skip = 1
+        elif a != "--low_vram":
+            out.append(a)
+    return out + ["--hann_chunk", str(chunk), "--hann_stride", str(max(1, chunk // 2)), "--low_vram"], chunk
+
+start = os.path.getsize(os.path.join(job, "engine.log"))
+code = run(cmd)
+if no_shared and code not in ("0", "cancelled", "start"):
+    text = log_since(start).lower()
+    if any(w in text for w in ("out of memory", "outofmemoryerror", "insufficient memory")):
+        retry, chunk = smaller(cmd, text)
+        if retry:
+            log.write(("\n[plugin] out of GPU memory: trying again with Low-VRAM mode and a %d-frame window\n"
+                       % chunk).encode())
+            code = run(retry)
 shutil.rmtree(os.path.join(job, "run"), ignore_errors=True)
+shutil.rmtree(os.path.join(job, "vramhook"), ignore_errors=True)
 for _ in range(50):  # Windows: the plugin may be reading it right now
     try:
         with open(os.path.join(job, "exitcode.tmp"), "w") as f:
@@ -132,7 +198,7 @@ static const char* kWindowSizes[] = {"", "80", "48", "24", "8", "1"};
 std::string JobSpec::str() const {
     std::ostringstream o;
     o << "kind=" << kind << "\nstart=" << start << "\ncount=" << count << "\nlinear=" << linear << "\nhint=" << hint
-      << "\nhint_first_only=" << hintFirstOnly << "\nlow_vram=" << lowVram << "\nwindow=" << window << "\ndespill=" << despill
+      << "\nhint_first_only=" << hintFirstOnly << "\nlow_vram=" << lowVram << "\nshared_vram=" << sharedVram << "\nwindow=" << window << "\ndespill=" << despill
       << "\nhint_quality=" << hintQ << "\nfps=" << fps << "\n";
     return o.str();
 }
@@ -152,6 +218,7 @@ JobSpec JobSpec::parse(const std::string& s) {
             else if (k == "linear") j.linear = v == "1";
             else if (k == "hint") j.hint = v == "1";
             else if (k == "low_vram") j.lowVram = v == "1";
+            else if (k == "shared_vram") j.sharedVram = v != "0";
             else if (k == "hint_first_only") j.hintFirstOnly = v == "1";
             else if (k == "window") j.window = std::stoi(v);
             else if (k == "despill") j.despill = std::stod(v);
@@ -340,6 +407,12 @@ void waitForWrites() {
     WriterQueue& q = Q();
     std::unique_lock<std::mutex> lock(q.mu);
     q.idle.wait(lock, [&] { return q.tasks.empty() && q.busy == 0; });
+}
+
+bool captureQueueFull() {
+    WriterQueue& q = Q();
+    std::lock_guard<std::mutex> lock(q.mu);
+    return q.bytes > kMaxQueueBytes / 2;
 }
 
 bool frameCaptured(const std::string& c, const std::string& id, int idx) {
@@ -549,6 +622,7 @@ bool launchJob(const std::string& c, const std::string& id, bool partialOk, std:
         {"HF_HUB_OFFLINE", "1"},
         {"TRANSFORMERS_OFFLINE", "1"}, {"PYTORCH_ENABLE_MPS_FALLBACK", "1"},
         {"PATH", enginePath(cfg)}};
+    if (!s.sharedVram) env["CK2_NO_SHARED_VRAM"] = "1";  // runner.py: limit + retry on out of memory
 
     {
         std::ofstream log(joinPath(dir, "engine.log"), std::ios::app);

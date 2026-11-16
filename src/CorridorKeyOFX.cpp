@@ -13,6 +13,7 @@
 // Key Licence 2.0) and the OpenFX SDK (BSD). Not an official Corridor product.
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -43,7 +44,7 @@ namespace fs = std::filesystem;
     "Community plugin, not an official Corridor Digital product."
 #define kPluginIdentifier "io.github.ck2gui.CorridorKey2"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 2
+#define kPluginVersionMinor 3
 
 #define kHintClip "Hint"
 
@@ -61,6 +62,7 @@ namespace fs = std::filesystem;
 #define kInputColor "inputColor"
 #define kMemory "memory"
 #define kLowVram "lowVram"
+#define kSharedVram "sharedVram"
 #define kExportDir "exportDir"
 #define kExport "exportExr"
 #define kHostInfo "hostInfo"
@@ -74,14 +76,19 @@ namespace fs = std::filesystem;
 static const char* kWindows[] = {"Auto (from free GPU memory)", "80/40 – steadiest, most memory", "48/24",
                                  "24/12", "8/4", "1/1 – single frames, least memory"};
 
-static std::string statusText(const ck::JobStatus& st) {
+static std::string statusText(const ck::JobStatus& st, bool autoCapture = false) {
     std::ostringstream o;
     switch (st.state) {
     case ck::JobState::Missing: return "Not keyed yet. Press 'Key clip'.";
     case ck::JobState::Capturing:
-        o << "Capturing frames: " << st.captured << " of " << st.count
-          << ". Play the clip once from start to end; keying starts by itself (also when playback "
-             "loops back). Or press 'Key captured frames now'.";
+        if (autoCapture)
+            o << "Reading the clip's frames: " << st.captured << " of " << st.count
+              << ". Keying starts by itself when they're all in. (This node, or one after it, must be "
+                 "in the viewer at full resolution.)";
+        else
+            o << "Capturing frames: " << st.captured << " of " << st.count
+              << ". Play the clip once from start to end; keying starts by itself (also when playback "
+                 "loops back). Or press 'Key captured frames now'.";
         return o.str();
     case ck::JobState::Keying:
         if (st.cancelling) return "Stopping…";
@@ -126,6 +133,7 @@ public:
         inputColor_ = fetchChoiceParam(kInputColor);
         memory_ = fetchChoiceParam(kMemory);
         lowVram_ = fetchBooleanParam(kLowVram);
+        sharedVram_ = fetchBooleanParam(kSharedVram);
         exportDir_ = fetchStringParam(kExportDir);
         notify_ = fetchBooleanParam(kNotify);
         plog("node created in " + detectHost().text + (hint_ ? " (Fusion/general: has Hint input)" : " (filter)"));
@@ -200,6 +208,10 @@ private:
     std::mutex keyMu_;
     std::string keyMem_;
     void capture(const KeyData& k, int idx, OFX::Image* src, double time);
+    void captureMore(const KeyData& k);  // automatic capture: the next frames of the clip
+    bool autoCapture() const { return auto_->enabled() && !autoCapFailed_; }
+    std::mutex autoMu_;                    // one render thread reads ahead at a time
+    std::atomic<bool> autoCapFailed_{false};  // host won't hand out other frames: playback it is
 
     OFX::Clip *dst_, *src_, *hint_;
     OFX::StringParam *status_, *keyData_, *exportDir_, *keyName_;
@@ -208,7 +220,7 @@ private:
     OFX::IntParam* tick_;
     OFX::ChoiceParam *output_, *inputColor_, *memory_;
     OFX::DoubleParam *hintQ_, *despill_;
-    OFX::BooleanParam *lowVram_, *notify_;
+    OFX::BooleanParam *lowVram_, *sharedVram_, *notify_;
     std::unique_ptr<AutoRefresh> auto_;  // last: stopped before the rest goes away
 };
 
@@ -243,6 +255,35 @@ void CorridorKeyPlugin::capture(const KeyData& k, int idx, OFX::Image* src, doub
         if (!himg || !imageToBuffer(himg.get(), 1, hint, hw, hh, hb) || hw != w || hh != h) hint.clear();
     }
     ck::captureFrame(cache, k.id, idx, std::move(rgb), w, h, b.x1, b.y1, std::move(hint));
+}
+
+// Automatic capture: each render also reads the next missing frames of the clip
+// (about 0.4 s of work), then returns so the host stays responsive. AutoRefresh asks
+// for the next render right away, so batch follows batch without playback.
+void CorridorKeyPlugin::captureMore(const KeyData& k) {
+    if (!autoCapture()) return;
+    std::unique_lock<std::mutex> lock(autoMu_, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    const std::string cache = cachedCacheDir();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < k.count; ++i) {
+        if (ck::frameCaptured(cache, k.id, i)) continue;
+        if (ck::captureQueueFull() || abort()) break;
+        const double t = k.start + i;
+        std::unique_ptr<OFX::Image> img;
+        try {
+            img.reset(src_->fetchImage(t));
+        } catch (...) {
+        }
+        if (!img) {
+            autoCapFailed_ = true;
+            plog("job " + k.id + ": the host didn't hand out frame " + std::to_string(i) +
+                 "; automatic capture is off for this node, play the clip instead");
+            return;
+        }
+        capture(k, i, img.get(), t);
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(400)) break;
+    }
 }
 
 void CorridorKeyPlugin::render(const OFX::RenderArguments& args) {
@@ -291,10 +332,13 @@ void CorridorKeyPlugin::render(const OFX::RenderArguments& args) {
                 capture(k, idx, src.get(), args.time);
                 if (ck::notePlayback(cache, k.id, idx)) plog("job " + k.id + ": playback looped, keying the captured frames");
             }
+            if (src && fullRes) captureMore(k);
             if (!fullRes) {
                 bn = {"CORRIDORKEY: SET PLAYBACK TO FULL RESOLUTION (PROXY OFF) TO CAPTURE", 1.0f, 0.75f, 0.1f};
             } else {
-                std::snprintf(line, sizeof(line), "CAPTURING %d/%d - PLAY THE CLIP ONCE",
+                std::snprintf(line, sizeof(line),
+                              autoCapture() ? "READING FRAMES %d/%d - KEYING STARTS BY ITSELF"
+                                            : "CAPTURING %d/%d - PLAY THE CLIP ONCE",
                               std::min(st.captured + 1, st.count), st.count);
                 bn = {line, 1.0f, 0.8f, 0.1f, st.count ? (double)st.captured / st.count : 0.0};
             }
@@ -399,11 +443,14 @@ RefreshState CorridorKeyPlugin::refreshState() {
         return r;
     }
     ck::JobStatus st = ck::jobStatus(cachedCacheDir(), k.id, true);
-    r.status = statusText(st);
+    const bool autoCap = st.state == ck::JobState::Capturing && autoCapture();
+    r.status = statusText(st, autoCap);
     r.view = viewSig(k.id, st);
-    r.stage = k.id + ":" + std::to_string((int)st.state) + (st.cancelling ? ":stopping" : "");
+    r.stage = k.id + ":" + std::to_string((int)st.state) + (st.cancelling ? ":stopping" : "") +
+              (autoCap ? ":auto" : "");
     r.active = st.state == ck::JobState::Capturing || st.state == ck::JobState::Keying;
     r.stamp = r.active;
+    r.pump = autoCap;
     return r;
 }
 
@@ -482,6 +529,7 @@ void CorridorKeyPlugin::keyClip() {
     spec.linear = v == 1;
     memory_->getValue(spec.window);
     lowVram_->getValue(spec.lowVram);
+    sharedVram_->getValue(spec.sharedVram);
     despill_->getValue(spec.despill);
     hintQ_->getValue(spec.hintQ);
     // Resolve's Fusion page doesn't provide frame-rate properties (asking throws),
@@ -597,7 +645,7 @@ void CorridorKeyPluginFactory::describe(OFX::ImageEffectDescriptor& desc) {
     desc.setHostFrameThreading(false);
     desc.setSupportsMultiResolution(true);
     desc.setSupportsTiles(false);
-    desc.setTemporalClipAccess(false);
+    desc.setTemporalClipAccess(true);  // automatic capture reads the clip's other frames
     desc.setRenderTwiceAlways(false);
     desc.setSupportsMultipleClipPARs(false);
     desc.setRenderThreadSafety(OFX::eRenderFullySafe);
@@ -608,8 +656,10 @@ void CorridorKeyPluginFactory::describeInContext(OFX::ImageEffectDescriptor& des
     src->addSupportedComponent(OFX::ePixelComponentRGBA);
     src->addSupportedComponent(OFX::ePixelComponentRGB);
     src->setSupportsTiles(false);
+    src->setTemporalClipAccess(true);
     if (context == OFX::eContextGeneral) {
         OFX::ClipDescriptor* hint = desc.defineClip(kHintClip);
+        hint->setTemporalClipAccess(true);
         hint->addSupportedComponent(OFX::ePixelComponentRGBA);
         hint->addSupportedComponent(OFX::ePixelComponentAlpha);
         hint->setOptional(true);
@@ -730,6 +780,16 @@ void CorridorKeyPluginFactory::describeInContext(OFX::ImageEffectDescriptor& des
     lv->setEvaluateOnChange(false);
     lv->setHint("Only with a manual window. Uses disk instead of GPU memory (slower).");
     page->addChild(*lv);
+
+    OFX::BooleanParamDescriptor* sv = desc.defineBooleanParam(kSharedVram);
+    sv->setLabel("Use shared GPU memory");
+    sv->setDefault(true);
+    sv->setAnimates(false);
+    sv->setEvaluateOnChange(false);
+    sv->setHint("When the GPU's own memory is full, keep going in shared GPU memory (system RAM): slower, "
+                "but it doesn't stop. Off: running out of GPU memory retries once with Low-VRAM mode and a "
+                "smaller window.");
+    page->addChild(*sv);
 
     OFX::BooleanParamDescriptor* nt = desc.defineBooleanParam(kNotify);
     nt->setLabel("Notify when done");

@@ -863,6 +863,7 @@ OFX::ImageEffect* CorridorKeyPluginFactory::createInstance(OfxImageEffectHandle 
 
 OFX::PluginFactory* makePassFactory();
 OFX::PluginFactory* makeRotoFactory();
+OFX::PluginFactory* makeRotoMatteFactory();
 
 namespace OFX {
 namespace Plugin {
@@ -871,6 +872,7 @@ void getPluginIDs(OFX::PluginFactoryArray& ids) {
     ids.push_back(&p);
     ids.push_back(makePassFactory());
     ids.push_back(makeRotoFactory());
+    ids.push_back(makeRotoMatteFactory());
 }
 }  // namespace Plugin
 }  // namespace OFX

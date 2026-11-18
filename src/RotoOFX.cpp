@@ -1,18 +1,25 @@
-// CorridorKey Roto: pick characters in a picker window (click / right-click /
-// drag rectangles), SAM 2.1 tracks them through the clip in the background, and
-// the node outputs a hint matte for CorridorKey's Hint input, a garbage-filled
-// source, or an overlay to check it.
+// Two nodes from one class:
 //
-//   1. "Pick character…" opens the picker on the current frame (live preview).
-//   2. "Track clip", then play the clip once (frames are captured while playing,
-//      like Key clip). Tracking runs in the background.
+// CorridorKey Hint: pick what to keep in a picker window (points, boxes, lassos),
+// SAM 2.1 tracks it through the clip in the background, and the node outputs a
+// hint matte for CorridorKey's Hint input, a garbage-filled source, or an overlay.
+//
+// CorridorKey Roto: the same picking and tracking (SAM 2.1 or SAM 3) in its own
+// Python environment, then MatAnyone 2 (optional) for soft hair/motion-blur
+// edges: outputs a finished matte / cutout, and editable shapes for Fusion.
+//
+//   1. "Pick…" opens the picker on the current frame (live preview).
+//   2. "Track clip": the node reads the clip's frames by itself, then tracks
+//      in the background.
 
 #include "common.h"
 
 namespace fs = std::filesystem;
 
-#define kRotoId "io.github.ck2gui.CorridorKey2Roto"
-#define kRotoName "CorridorKey Roto"
+#define kRotoId "io.github.ck2gui.CorridorKey2Roto"  // the Hint node (kept: existing projects use it)
+#define kHintName "CorridorKey Hint"
+#define kMatteId "io.github.ck2gui.CorridorKey2RotoMatte"
+#define kMatteName "CorridorKey Roto"
 
 #define kRPick "pickCharacter"
 #define kRTrack "trackClip"
@@ -33,12 +40,18 @@ namespace fs = std::filesystem;
 #define kRData "rotoData"
 #define kRTick "refreshTick"
 #define kRNotify "notifyDone"
+#define kREdges "edges"
+#define kRShapes "saveShapes"
+#define kRShapesDir "shapesFolder"
 
-enum RotoOut { eOverlay = 0, eHint, eGarbage, eRSource };
+enum RotoOut { eOverlay = 0, eHint, eGarbage, eRSource };     // Hint node outputs
+enum MatteOut { eMCutout = 0, eMMatte, eMOverlay, eMSource };  // Roto node outputs
 static const char* kModels[][2] = {{"facebook/sam2.1-hiera-large", "SAM 2.1 Large – best edges"},
                                    {"facebook/sam2.1-hiera-base-plus", "SAM 2.1 Base+ – balanced"},
                                    {"facebook/sam2.1-hiera-small", "SAM 2.1 Small – faster"},
-                                   {"facebook/sam2.1-hiera-tiny", "SAM 2.1 Tiny – fastest"}};
+                                   {"facebook/sam2.1-hiera-tiny", "SAM 2.1 Tiny – fastest"},
+                                   {"facebook/sam3", "SAM 3 – newest (needs a Hugging Face token)"}};
+static const int kHintModels = 4, kMatteModels = 5;  // SAM 3 only in the Roto node (its own environment)
 
 // 8-bit display image for the picker window (PPM: Qt reads it, no extra libraries).
 static bool writePPM(const std::string& path, const std::vector<float>& rgb, int w, int h, bool linear) {
@@ -231,6 +244,31 @@ static Field shapeMask(const Mask& m, int W, int H, int grow, double soften) {
     return f;
 }
 
+// Soft mask (the Roto node's matte) at the output size: bilinear, no threshold.
+static Field softMask(const Mask& m, int W, int H) {
+    Field f;
+    f.w = W;
+    f.h = H;
+    f.v.assign((size_t)W * H, 0.0f);
+    const double sx = (double)m.w / W, sy = (double)m.h / H;
+    parallelRows(0, H, [&](int a, int b) {
+        for (int y = a; y < b; ++y) {
+            double my = (y + 0.5) * sy - 0.5;
+            int y0 = std::clamp((int)std::floor(my), 0, m.h - 1), y1 = std::min(y0 + 1, m.h - 1);
+            float fy = (float)std::clamp(my - y0, 0.0, 1.0);
+            for (int x = 0; x < W; ++x) {
+                double mx = (x + 0.5) * sx - 0.5;
+                int x0 = std::clamp((int)std::floor(mx), 0, m.w - 1), x1 = std::min(x0 + 1, m.w - 1);
+                float fx = (float)std::clamp(mx - x0, 0.0, 1.0);
+                float top = m.v[(size_t)y0 * m.w + x0] * (1 - fx) + m.v[(size_t)y0 * m.w + x1] * fx;
+                float bot = m.v[(size_t)y1 * m.w + x0] * (1 - fx) + m.v[(size_t)y1 * m.w + x1] * fx;
+                f.v[(size_t)y * W + x] = std::clamp(top * (1 - fy) + bot * fy, 0.0f, 1.0f);
+            }
+        }
+    });
+    return f;
+}
+
 // Median screen colour outside the keep area (like ck2-gui's garbage fill).
 static void screenColour(const std::vector<float>& rgb, int W, int H, const Field& keep, int screenMode, float out[3]) {
     std::vector<float> ch[3];
@@ -297,23 +335,28 @@ struct RotoData {
 
 class CorridorKeyRoto : public OFX::ImageEffect {
 public:
-    explicit CorridorKeyRoto(OfxImageEffectHandle h) : ImageEffect(h) {
+    CorridorKeyRoto(OfxImageEffectHandle h, bool matte) : ImageEffect(h), matte_(matte) {
         dst_ = fetchClip(kOfxImageEffectOutputClipName);
         src_ = fetchClip(kOfxImageEffectSimpleSourceClipName);
         status_ = fetchStringParam(kRStatus);
         data_ = fetchStringParam(kRData);
         tick_ = fetchIntParam(kRTick);
         output_ = fetchChoiceParam(kROutput);
-        grow_ = fetchIntParam(kRGrow);
-        soften_ = fetchDoubleParam(kRSoften);
-        margin_ = fetchIntParam(kRMargin);
-        feather_ = fetchDoubleParam(kRFeather);
-        screen_ = fetchChoiceParam(kRScreen);
+        if (matte_) {
+            edges_ = fetchChoiceParam(kREdges);
+            shapesDir_ = fetchStringParam(kRShapesDir);
+        } else {
+            grow_ = fetchIntParam(kRGrow);
+            soften_ = fetchDoubleParam(kRSoften);
+            margin_ = fetchIntParam(kRMargin);
+            feather_ = fetchDoubleParam(kRFeather);
+            screen_ = fetchChoiceParam(kRScreen);
+        }
         model_ = fetchChoiceParam(kRModel);
         input_ = fetchChoiceParam(kRInput);
         notify_ = fetchBooleanParam(kRNotify);
         auto_ = std::make_unique<AutoRefresh>(
-            "Roto node", [this] { return refreshState(); },
+            matte_ ? "Roto node" : "Hint node", [this] { return refreshState(); },
             [this](const std::string& text) {
                 std::string cur;
                 status_->getValue(cur);
@@ -335,7 +378,7 @@ public:
     bool isIdentity(const OFX::IsIdentityArguments& args, OFX::Clip*& clip, double& time) override {
         int o = 0;
         output_->getValue(o);
-        if (o == eRSource) {
+        if (o == (matte_ ? (int)eMSource : (int)eRSource)) {
             clip = src_;
             time = args.time;
             return true;
@@ -347,7 +390,10 @@ public:
     void changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) override;
 
 private:
-    std::string root() { return ck::rotoRoot(cachedCacheDir()); }
+    std::string root() { return matte_ ? ck::matteRoot(cachedCacheDir()) : ck::rotoRoot(cachedCacheDir()); }
+    const char* tag() const { return matte_ ? "ROTO" : "HINT"; }        // banners
+    const char* nodeName() const { return matte_ ? kMatteName : kHintName; }
+    void saveShapes();
     RotoData data() {
         std::string s;
         try {
@@ -371,7 +417,7 @@ private:
         bump();
     }
     void setStatus(const std::string& v) {
-        if (v.rfind("\xe2\x9c\x97", 0) == 0) plog("roto: " + v);  // log every ✗ message
+        if (v.rfind("\xe2\x9c\x97", 0) == 0) plog(std::string(matte_ ? "roto: " : "hint: ") + v);  // log every ✗
         try {
             status_->setValue(v);
         } catch (...) {
@@ -389,7 +435,7 @@ private:
     std::string modelName() {
         int m = 0;
         model_->getValue(m);
-        return kModels[std::clamp(m, 0, 3)][0];
+        return kModels[std::clamp(m, 0, (matte_ ? kMatteModels : kHintModels) - 1)][0];
     }
     bool ensureJob(RotoData& r, std::string* err);
     void pick(double time);
@@ -398,15 +444,16 @@ private:
     RefreshState refreshState();
     std::string viewSig(const RotoData& r, const ck::JobStatus& st);
 
+    const bool matte_;  // false: Hint node, true: Roto node
     OFX::Clip *dst_, *src_;
-    OFX::StringParam *status_, *data_;
-    OFX::IntParam *tick_, *grow_, *margin_;
-    OFX::DoubleParam *soften_, *feather_;
-    OFX::ChoiceParam *output_, *screen_, *model_, *input_;
+    OFX::StringParam *status_, *data_, *shapesDir_ = nullptr;
+    OFX::IntParam *tick_, *grow_ = nullptr, *margin_ = nullptr;
+    OFX::DoubleParam *soften_ = nullptr, *feather_ = nullptr;
+    OFX::ChoiceParam *output_, *screen_ = nullptr, *model_, *input_, *edges_ = nullptr;
     OFX::BooleanParam* notify_;
     std::mutex mu_;
     std::string mem_;
-    // Pick character… only asks for the frame; the next render (where hosts hand out
+    // Pick… only asks for the frame; the next render (where hosts hand out
     // frames safely) saves it and opens the picker. Fetching it inside the button
     // handler could hang Resolve on Windows (Fusion waits for itself).
     std::mutex pickMu_;
@@ -429,9 +476,14 @@ bool CorridorKeyRoto::ensureJob(RotoData& r, std::string* err) {
         if (err) *err = cfg.error;
         return false;
     }
+    if (matte_ && ck::rotoEnvPython(cfg).empty()) {
+        if (err) *err = "The Roto models aren't installed. In ck2-gui: Setup -> Roto models; or run the plugin's "
+                        "installer with --roto (Windows: -Roto), plus --matanyone for hair.";
+        return false;
+    }
     if (!src_->isConnected()) {
-        if (err) *err = "Connect the clip to this node's input first (in Fusion: drag from the MediaIn's output "
-                        "to the Roto node's yellow input; the same clip also stays connected to CorridorKey)";
+        if (err) *err = std::string("Connect the clip to this node's input first (in Fusion: drag from the MediaIn's "
+                                    "output to the ") + (matte_ ? "Roto" : "Hint") + " node's yellow input)";
         return false;
     }
     std::string how;
@@ -452,7 +504,8 @@ bool CorridorKeyRoto::ensureJob(RotoData& r, std::string* err) {
     r = RotoData{ck::randomId(), t0, spec.count};
     if (!ck::createJob(root(), r.id, spec, err)) return false;
     setData(r.str());
-    plog("roto job " + r.id + " created: " + std::to_string(spec.count) + " frames from " + std::to_string(t0));
+    plog(std::string(matte_ ? "roto" : "hint") + " job " + r.id + " created: " + std::to_string(spec.count) +
+         " frames from " + std::to_string(t0));
     return true;
 }
 
@@ -503,7 +556,7 @@ bool CorridorKeyRoto::pickFromRender(const RotoData& r, int idx, OFX::Image* src
         }
         if (!fullRes) {
             pickNote_ = "The viewer is at reduced resolution (proxy): set it to full resolution, then press "
-                        "'Pick character…' again.";
+                        "'Pick…' again.";
             pickJob_.clear();
             return true;
         }
@@ -544,14 +597,22 @@ void CorridorKeyRoto::track() {
     std::string err;
     RotoData r = data();
     if (!r.valid()) {
-        setStatus("✗ Press 'Pick character…' first.");
+        setStatus("✗ Press 'Pick…' first.");
         return;
     }
     ck::Prompts pr = ck::readPrompts(root(), r.id);
     if (!pr.valid) {
         setStatus(ck::pickerOpen(root(), r.id) ? "✗ Press 'Use this selection' in the picker window first."
-                                               : "✗ Press 'Pick character…' and choose what to keep first.");
+                                               : "✗ Press 'Pick…' and choose what to keep first.");
         return;
+    }
+    if (matte_) {  // which edges the helper makes (read by requestTrack)
+        int e = 0;
+        try {
+            edges_->getValue(e);
+        } catch (...) {
+        }
+        ck::writeTextAtomic(ck::joinPath(ck::joinPath(root(), r.id), "matte.txt"), e == 1 ? "sam" : "matanyone");
     }
     ck::TrackStart ts = ck::requestTrack(root(), r.id, &err);
     if (ts == ck::TrackStart::Failed) {
@@ -565,8 +626,36 @@ void CorridorKeyRoto::track() {
         notify_->getValue(on);
     } catch (...) {
     }
-    setNotify(root(), r.id, "CorridorKey Roto", on);
+    setNotify(root(), r.id, nodeName(), on);
     refresh();
+}
+
+// "Save shapes for Fusion": the tracked objects as keyframed Polygon masks.
+void CorridorKeyRoto::saveShapes() {
+    RotoData r = data();
+    std::string src = r.valid() ? ck::joinPath(ck::joinPath(root(), r.id), "shapes.setting") : "";
+    if (src.empty() || !ck::fileExists(src)) {
+        setStatus("✗ No shapes yet: press Track clip and wait for ✓ first.");
+        return;
+    }
+    std::string dir;
+    try {
+        shapesDir_->getValue(dir);
+    } catch (...) {
+    }
+    if (dir.empty()) dir = ck::joinPath(cachedCacheDir(), "shapes");
+    ck::makeDirs(dir);
+    std::string dst = ck::joinPath(dir, "CorridorKey Roto " + r.id.substr(0, 6) + ".setting");
+    std::error_code ec;
+    fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        setStatus("✗ Couldn't save the shapes to " + dst + ": " + ec.message());
+        return;
+    }
+    plog("roto shapes saved: " + dst);
+    openWithSystem(dir);
+    setStatus("Shapes saved: " + dst + ". Drag the file into Fusion's node editor (one Polygon mask per object, "
+              "a keyframe on every frame).");
 }
 
 std::string CorridorKeyRoto::viewSig(const RotoData& r, const ck::JobStatus& st) {
@@ -587,7 +676,7 @@ RefreshState CorridorKeyRoto::refreshState() {
     RefreshState out;
     RotoData r = data();
     if (!r.valid()) {
-        out.status = "Go to a frame where what you want to keep is clearly visible and press 'Pick character…'.";
+        out.status = "Go to a frame where what you want to keep is clearly visible and press 'Pick…'.";
         out.stage = out.view = "none";
         return out;
     }
@@ -624,7 +713,7 @@ RefreshState CorridorKeyRoto::refreshState() {
         else if (pr.valid)
             o << pr.objects << " object(s) picked on frame " << pr.frame << ". Press 'Track clip'.";
         else
-            o << "Press 'Pick character…' and choose what to keep.";
+            o << "Press 'Pick…' and choose what to keep.";
         break;
     case ck::JobState::Keying:
         if (!ck::rotoDaemonAlive(root()))
@@ -638,11 +727,12 @@ RefreshState CorridorKeyRoto::refreshState() {
         break;
     case ck::JobState::Done:
         o << "✓ Tracked frames " << st.keyedFirst << "-" << (st.keyedFirst + st.keyedCount - 1)
-          << ". Now press Key clip on the CorridorKey node.";
+          << (matte_ ? ". Outputs: Cutout / Matte; 'Save shapes for Fusion' for editable shapes."
+                     : ". Now press Key clip on the CorridorKey node.");
         break;
     case ck::JobState::Failed: o << "✗ Tracking failed: " << st.message; break;
     case ck::JobState::Cancelled: o << "Stopped. Press 'Track clip' to try again."; break;
-    default: o << "Go to a frame where what you want to keep is clearly visible and press 'Pick character…'."; break;
+    default: o << "Go to a frame where what you want to keep is clearly visible and press 'Pick…'."; break;
     }
     out.status = o.str();
     out.view = viewSig(r, st);
@@ -667,7 +757,15 @@ void CorridorKeyRoto::changedParam(const OFX::InstanceChangedArgs& args, const s
     if (name == kRReport) {
         std::string st;
         try { status_->getValue(st); } catch (...) {}
-        reportBug(detectHost().text, "CorridorKey Roto", st);
+        reportBug(detectHost().text, nodeName(), st);
+        return;
+    }
+    if (name == kRShapes) {
+        try {
+            saveShapes();
+        } catch (...) {
+            setStatus("✗ Saving the shapes failed: " + describeException());
+        }
         return;
     }
     if (name == kRNotify) {
@@ -678,7 +776,7 @@ void CorridorKeyRoto::changedParam(const OFX::InstanceChangedArgs& args, const s
         } catch (...) {
         }
         // Only matters once tracking was asked for (Track clip writes it again anyway).
-        if (r.valid() && ck::trackWanted(root(), r.id)) setNotify(root(), r.id, "CorridorKey Roto", on);
+        if (r.valid() && ck::trackWanted(root(), r.id)) setNotify(root(), r.id, nodeName(), on);
         return;
     }
     bool button = name == kRPick || name == kRTrack || name == kRTrackNow || name == kRStop || name == kRRefresh || name == kRForget;
@@ -717,7 +815,7 @@ void CorridorKeyRoto::changedParam(const OFX::InstanceChangedArgs& args, const s
             RotoData r = data();
             if (r.valid()) ck::forgetJob(root(), r.id);
             setData("");
-            setStatus("Go to a frame where what you want to keep is clearly visible and press 'Pick character…'.");
+            setStatus("Go to a frame where what you want to keep is clearly visible and press 'Pick…'.");
         }
     } catch (...) {
         std::string why = describeException();
@@ -742,7 +840,7 @@ void CorridorKeyRoto::captureMore(const RotoData& r) {
         }
         if (!img) {
             autoCapFailed_ = true;
-            plog("roto " + r.id + ": the host didn't hand out frame " + std::to_string(i) +
+            plog(std::string(matte_ ? "roto " : "hint ") + r.id + ": the host didn't hand out frame " + std::to_string(i) +
                  "; automatic capture is off for this node, play the clip instead");
             return;
         }
@@ -767,7 +865,7 @@ void CorridorKeyRoto::render(const OFX::RenderArguments& args) {
     const std::string rr = root();
     const int idx = (int)std::lround(args.time - r.start);
     const bool fullRes = std::fabs(args.renderScale.x - 1.0) < 1e-6 && std::fabs(args.renderScale.y - 1.0) < 1e-6;
-    if (r.valid()) pickFromRender(r, idx, src.get(), fullRes);  // Pick character… waiting for this frame?
+    if (r.valid()) pickFromRender(r, idx, src.get(), fullRes);  // Pick… waiting for this frame?
     if (out == eRSource) return copySource(dst.get(), src.get(), rw);
 
     ck::JobStatus st = r.valid() ? ck::jobStatus(rr, r.id) : ck::JobStatus{};
@@ -798,28 +896,32 @@ void CorridorKeyRoto::render(const OFX::RenderArguments& args) {
     Banner bn;
     char line[160];
     if (!r.valid()) {
-        bn = {src ? "ROTO: PRESS PICK CHARACTER IN THE INSPECTOR" : "ROTO: CONNECT THE CLIP TO THIS NODE'S INPUT",
-              0.9f, 0.3f, 0.3f};
+        std::snprintf(line, sizeof(line), src ? "%s: PRESS PICK IN THE INSPECTOR" : "%s: CONNECT THE CLIP TO THIS NODE'S INPUT", tag());
+        bn = {line, 0.9f, 0.3f, 0.3f};
     } else if (st.state == ck::JobState::Capturing && ck::trackWanted(rr, r.id)) {
-        if (!fullRes) bn = {"ROTO: SET PLAYBACK TO FULL RESOLUTION TO CAPTURE", 1.0f, 0.75f, 0.1f};
-        else {
+        if (!fullRes) {
+            std::snprintf(line, sizeof(line), "%s: SET PLAYBACK TO FULL RESOLUTION TO CAPTURE", tag());
+            bn = {line, 1.0f, 0.75f, 0.1f};
+        } else {
             std::snprintf(line, sizeof(line),
-                          autoCapture() ? "ROTO: READING FRAMES %d/%d - TRACKING STARTS BY ITSELF"
-                                        : "ROTO: CAPTURING %d/%d - PLAY THE CLIP",
-                          std::min(st.captured + 1, st.count), st.count);
+                          autoCapture() ? "%s: READING FRAMES %d/%d - TRACKING STARTS BY ITSELF"
+                                        : "%s: CAPTURING %d/%d - PLAY THE CLIP",
+                          tag(), std::min(st.captured + 1, st.count), st.count);
             bn = {line, 1.0f, 0.8f, 0.1f, st.count ? (double)st.captured / st.count : 0.0};
         }
     } else if (st.state == ck::JobState::Keying) {
-        std::snprintf(line, sizeof(line), auto_->enabled() ? "ROTO: TRACKING %d%% - UPDATES BY ITSELF"
-                                                           : "ROTO: TRACKING %d%% - PRESS REFRESH NOW TO UPDATE",
-                      (int)std::lround(st.progress * 100));
+        std::snprintf(line, sizeof(line), auto_->enabled() ? "%s: TRACKING %d%% - UPDATES BY ITSELF"
+                                                           : "%s: TRACKING %d%% - PRESS REFRESH NOW TO UPDATE",
+                      tag(), (int)std::lround(st.progress * 100));
         bn = {line, 0.3f, 0.6f, 1.0f, st.progress};
     } else if (st.state == ck::JobState::Failed) {
-        bn = {"ROTO: TRACKING FAILED - SEE STATUS", 1.0f, 0.25f, 0.25f};
+        std::snprintf(line, sizeof(line), "%s: TRACKING FAILED - SEE STATUS", tag());
+        bn = {line, 1.0f, 0.25f, 0.25f};
     } else if (st.state != ck::JobState::Done) {
-        if (ck::pickerOpen(rr, r.id)) bn = {"ROTO: PICKER WINDOW IS OPEN", 0.3f, 0.6f, 1.0f};
-        else if (ck::readPrompts(rr, r.id).valid) bn = {"ROTO: PICKED - PRESS TRACK CLIP", 0.4f, 0.85f, 0.4f};
-        else bn = {"ROTO: PRESS PICK CHARACTER IN THE INSPECTOR", 0.6f, 0.6f, 0.6f};
+        const bool open = ck::pickerOpen(rr, r.id), picked = ck::readPrompts(rr, r.id).valid;
+        std::snprintf(line, sizeof(line), open ? "%s: PICKER WINDOW IS OPEN" : picked ? "%s: PICKED - PRESS TRACK CLIP"
+                                                                               : "%s: PRESS PICK IN THE INSPECTOR", tag());
+        bn = {line, open ? 0.3f : picked ? 0.4f : 0.6f, open ? 0.6f : picked ? 0.85f : 0.6f, open ? 1.0f : picked ? 0.4f : 0.6f};
     }
 
     OfxRectI db = dst->getBounds();
@@ -827,7 +929,7 @@ void CorridorKeyRoto::render(const OFX::RenderArguments& args) {
     const double sc = args.renderScale.x > 0 ? args.renderScale.x : 1.0;
 
     if (!mask || W <= 0 || H <= 0) {
-        if (out == eHint) {  // neutral hint (keep everything) until there is a mask
+        if (!matte_ && out == eHint) {  // neutral hint (keep everything) until there is a mask
             float white[4] = {1, 1, 1, 1};
             OFX::BitDepthEnum d = dst->getPixelDepth();
             int nc = components(dst->getPixelComponents());
@@ -843,11 +945,13 @@ void CorridorKeyRoto::render(const OFX::RenderArguments& args) {
 
     int grow = 0, margin = 0, scr = 0;
     double soften = 0, feather = 0;
-    grow_->getValue(grow);
-    soften_->getValue(soften);
-    margin_->getValue(margin);
-    feather_->getValue(feather);
-    screen_->getValue(scr);
+    if (!matte_) {
+        grow_->getValue(grow);
+        soften_->getValue(soften);
+        margin_->getValue(margin);
+        feather_->getValue(feather);
+        screen_->getValue(scr);
+    }
     if (abort()) return;
 
     OFX::BitDepthEnum dd = dst->getPixelDepth();
@@ -862,6 +966,34 @@ void CorridorKeyRoto::render(const OFX::RenderArguments& args) {
         const float* p = &rgb[((size_t)sy * sw + sx) * 3];
         o[0] = p[0]; o[1] = p[1]; o[2] = p[2];
     };
+
+    if (matte_) {  // Roto node: the soft matte as it is (MatAnyone 2 / SAM edges)
+        Field f = softMask(*mask, W, H);
+        parallelRows(rw.y1, rw.y2, [&](int a, int b) {
+            for (int y = a; y < b; ++y) {
+                int Yt = db.y2 - 1 - y;
+                for (int x = rw.x1; x < rw.x2; ++x) {
+                    void* p = dst->getPixelAddress(x, y);
+                    if (!p) continue;
+                    float m = f.v[(size_t)Yt * W + (x - db.x1)], s[3];
+                    srcPx(x - db.x1, Yt, s);
+                    float px[4];
+                    if (out == eMCutout) {  // straight colour + alpha (AlphaMultiply / Merge downstream)
+                        px[0] = s[0]; px[1] = s[1]; px[2] = s[2]; px[3] = m;
+                    } else if (out == eMMatte) {
+                        px[0] = px[1] = px[2] = m; px[3] = 1.0f;
+                    } else {  // overlay: red where kept, darker where removed
+                        float k = 0.45f * m, d = 0.6f + 0.4f * m;
+                        px[0] = (s[0] * (1 - k) + 0.9f * k) * d; px[1] = (s[1] * (1 - k) + 0.15f * k) * d;
+                        px[2] = (s[2] * (1 - k) + 0.15f * k) * d; px[3] = 1.0f;
+                    }
+                    writePixel(p, dd, dc, px);
+                }
+            }
+        });
+        if (out == eMOverlay || !bn.text.empty()) drawBanner(dst.get(), rw, bn);
+        return;
+    }
 
     if (out == eHint) {
         Field f = shapeMask(*mask, W, H, (int)std::lround(grow * sc), soften * sc);
@@ -915,16 +1047,19 @@ void CorridorKeyRoto::render(const OFX::RenderArguments& args) {
     if (out == eOverlay || !bn.text.empty()) drawBanner(dst.get(), rw, bn);
 }
 
-// ------------------------------------------------------------------ factory
+// ------------------------------------------------------------------ factories
+// Two classes (the OpenFX support library keeps per-class state), one description.
 
-mDeclarePluginFactory(CorridorKeyRotoFactory, {}, {});
-
-void CorridorKeyRotoFactory::describe(OFX::ImageEffectDescriptor& desc) {
-    desc.setLabels(kRotoName, kRotoName, kRotoName);
+static void describeRoto(OFX::ImageEffectDescriptor& desc, bool matte) {
+    const char* name = matte ? kMatteName : kHintName;
+    desc.setLabels(name, name, name);
     desc.setPluginGrouping("Keying");
     desc.setPluginDescription(
-        "Pick what to keep (people, props, areas) with clicks and rectangles; SAM 2.1 tracks it through the clip. Outputs a hint "
-        "matte for CorridorKey 2.0's Hint input, or the source with everything else filled with screen colour.");
+        matte ? "Roto without a green screen: pick what to keep (points, boxes, lassos), SAM tracks it through the "
+                "clip and MatAnyone 2 (optional, non-commercial licence) makes soft edges for hair and motion blur. "
+                "Outputs the cutout or the matte, and editable shapes for Fusion."
+              : "Pick what to keep (points, boxes, lassos); SAM 2.1 tracks it through the clip. Outputs a hint matte "
+                "for CorridorKey 2.0's Hint input, or the source with everything else filled with screen colour.");
     desc.addSupportedContext(OFX::eContextFilter);
     desc.addSupportedContext(OFX::eContextGeneral);
     desc.addSupportedBitDepth(OFX::eBitDepthFloat);
@@ -938,7 +1073,7 @@ void CorridorKeyRotoFactory::describe(OFX::ImageEffectDescriptor& desc) {
     desc.setRenderThreadSafety(OFX::eRenderFullySafe);
 }
 
-void CorridorKeyRotoFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::ContextEnum) {
+static void describeRotoInContext(OFX::ImageEffectDescriptor& desc, bool matte) {
     OFX::ClipDescriptor* src = desc.defineClip(kOfxImageEffectSimpleSourceClipName);
     src->addSupportedComponent(OFX::ePixelComponentRGBA);
     src->addSupportedComponent(OFX::ePixelComponentRGB);
@@ -955,9 +1090,11 @@ void CorridorKeyRotoFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
         b->setHint(hint);
         page->addChild(*b);
     };
-    button(kRPick, "Pick character…", "Opens a window on this frame: click on what to keep, right-click on what "
-                                      "to remove, drag rectangles around objects or areas. Works on anything, not only characters. Live preview.");
-    button(kRTrack, "Track clip", "Track the picked selection through the whole clip. Play the clip once to capture it.");
+    button(kRPick, "Pick…", "Opens a window on this frame. Point: click on what to keep, right-click on what to "
+                            "remove. Box: drag around something. Lasso: draw around an area (Alt or right-drag "
+                            "cuts it away); exact edge, or let SAM find it. Live preview.");
+    button(kRTrack, "Track clip", "Track the picked selection through the whole clip (the node reads the frames by "
+                                  "itself).");
     button(kRTrackNow, "Track captured frames now",
            "Don't wait for the whole clip: track the frames captured so far around the picked frame.");
     button(kRStop, "Stop", "Stop tracking.");
@@ -975,61 +1112,94 @@ void CorridorKeyRotoFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     OFX::StringParamDescriptor* status = desc.defineStringParam(kRStatus);
     status->setLabel("Status");
     status->setStringType(OFX::eStringTypeSingleLine);
-    status->setDefault("Go to a frame where what you want to keep is clearly visible and press 'Pick character…'.");
+    status->setDefault("Go to a frame where what you want to keep is clearly visible and press 'Pick…'.");
     status->setAnimates(false);
     status->setEvaluateOnChange(false);
     page->addChild(*status);
 
     OFX::ChoiceParamDescriptor* out = desc.defineChoiceParam(kROutput);
     out->setLabel("Output");
-    out->appendOption("Overlay – check the mask");
-    out->appendOption("Hint matte – into CorridorKey's Hint input (Fusion)");
-    out->appendOption("Garbage-filled source – feed CorridorKey directly");
-    out->appendOption("Source (bypass)");
-    out->setDefault(eHint);
+    if (matte) {
+        out->appendOption("Cutout – the clip with the matte as alpha");
+        out->appendOption("Matte – black and white");
+        out->appendOption("Overlay – check the matte");
+        out->appendOption("Source (bypass)");
+        out->setDefault(eMCutout);
+    } else {
+        out->appendOption("Overlay – check the mask");
+        out->appendOption("Hint matte – into CorridorKey's Hint input (Fusion)");
+        out->appendOption("Garbage-filled source – feed CorridorKey directly");
+        out->appendOption("Source (bypass)");
+        out->setDefault(eHint);
+    }
     out->setAnimates(false);
     page->addChild(*out);
 
-    OFX::IntParamDescriptor* grow = desc.defineIntParam(kRGrow);
-    grow->setLabel("Hint grow (px)");
-    grow->setRange(-200, 200);
-    grow->setDisplayRange(-50, 50);
-    grow->setDefault(0);
-    grow->setAnimates(false);
-    page->addChild(*grow);
-    OFX::DoubleParamDescriptor* soften = desc.defineDoubleParam(kRSoften);
-    soften->setLabel("Hint soften (px)");
-    soften->setRange(0, 200);
-    soften->setDisplayRange(0, 50);
-    soften->setDefault(4);
-    soften->setAnimates(false);
-    page->addChild(*soften);
-    OFX::IntParamDescriptor* margin = desc.defineIntParam(kRMargin);
-    margin->setLabel("Garbage margin (px)");
-    margin->setRange(0, 400);
-    margin->setDisplayRange(0, 150);
-    margin->setDefault(40);
-    margin->setAnimates(false);
-    page->addChild(*margin);
-    OFX::DoubleParamDescriptor* feather = desc.defineDoubleParam(kRFeather);
-    feather->setLabel("Garbage feather (px)");
-    feather->setRange(0, 400);
-    feather->setDisplayRange(0, 100);
-    feather->setDefault(30);
-    feather->setAnimates(false);
-    page->addChild(*feather);
-    OFX::ChoiceParamDescriptor* scr = desc.defineChoiceParam(kRScreen);
-    scr->setLabel("Screen colour");
-    scr->appendOption("Auto");
-    scr->appendOption("Green");
-    scr->appendOption("Blue");
-    scr->setDefault(0);
-    scr->setAnimates(false);
-    page->addChild(*scr);
+    if (matte) {
+        OFX::ChoiceParamDescriptor* ed = desc.defineChoiceParam(kREdges);
+        ed->setLabel("Edges");
+        ed->appendOption("MatAnyone 2 – hair and motion blur (non-commercial licence)");
+        ed->appendOption("SAM only – solid edges");
+        ed->setDefault(0);
+        ed->setAnimates(false);
+        ed->setEvaluateOnChange(false);
+        ed->setHint("MatAnyone 2 makes soft edges (hair, motion blur). It is free for non-commercial use only and is "
+                    "installed separately (ck2-gui: Setup -> Roto models). Without it, the edges come from SAM. "
+                    "Used by the next Track clip.");
+        page->addChild(*ed);
+        button(kRShapes, "Save shapes for Fusion",
+               "Saves the tracked objects as keyframed Polygon masks (.setting) and opens the folder: drag the file "
+               "into Fusion's node editor to edit the roto by hand. Shapes have solid edges; hair stays in the matte.");
+        OFX::StringParamDescriptor* sd = desc.defineStringParam(kRShapesDir);
+        sd->setLabel("Shapes folder");
+        sd->setStringType(OFX::eStringTypeDirectoryPath);
+        sd->setDefault("");
+        sd->setAnimates(false);
+        sd->setEvaluateOnChange(false);
+        sd->setHint("Where 'Save shapes for Fusion' writes (empty: a 'shapes' folder in the plugin's cache).");
+        page->addChild(*sd);
+    } else {
+        OFX::IntParamDescriptor* grow = desc.defineIntParam(kRGrow);
+        grow->setLabel("Hint grow (px)");
+        grow->setRange(-200, 200);
+        grow->setDisplayRange(-50, 50);
+        grow->setDefault(0);
+        grow->setAnimates(false);
+        page->addChild(*grow);
+        OFX::DoubleParamDescriptor* soften = desc.defineDoubleParam(kRSoften);
+        soften->setLabel("Hint soften (px)");
+        soften->setRange(0, 200);
+        soften->setDisplayRange(0, 50);
+        soften->setDefault(4);
+        soften->setAnimates(false);
+        page->addChild(*soften);
+        OFX::IntParamDescriptor* margin = desc.defineIntParam(kRMargin);
+        margin->setLabel("Garbage margin (px)");
+        margin->setRange(0, 400);
+        margin->setDisplayRange(0, 150);
+        margin->setDefault(40);
+        margin->setAnimates(false);
+        page->addChild(*margin);
+        OFX::DoubleParamDescriptor* feather = desc.defineDoubleParam(kRFeather);
+        feather->setLabel("Garbage feather (px)");
+        feather->setRange(0, 400);
+        feather->setDisplayRange(0, 100);
+        feather->setDefault(30);
+        feather->setAnimates(false);
+        page->addChild(*feather);
+        OFX::ChoiceParamDescriptor* scr = desc.defineChoiceParam(kRScreen);
+        scr->setLabel("Screen colour");
+        scr->appendOption("Auto");
+        scr->appendOption("Green");
+        scr->appendOption("Blue");
+        scr->setDefault(0);
+        scr->setAnimates(false);
+        page->addChild(*scr);
+    }
 
     OFX::ChoiceParamDescriptor* model = desc.defineChoiceParam(kRModel);
     model->setLabel("Model");
-    for (auto& m : kModels) model->appendOption(m[1]);
+    for (int i = 0; i < (matte ? kMatteModels : kHintModels); ++i) model->appendOption(kModels[i][1]);
 #ifdef __APPLE__
     model->setDefault(1);
 #else
@@ -1037,6 +1207,9 @@ void CorridorKeyRotoFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
 #endif
     model->setAnimates(false);
     model->setEvaluateOnChange(false);
+    if (matte)
+        model->setHint("SAM 3 is gated by Meta: request access on huggingface.co/facebook/sam3 with a free account, "
+                       "then add hf_token=YOUR_TOKEN to the plugin's ofx.conf (ck2-gui: Setup -> Roto models).");
     page->addChild(*model);
     OFX::ChoiceParamDescriptor* ic = desc.defineChoiceParam(kRInput);
     ic->setLabel("Input is");
@@ -1047,11 +1220,11 @@ void CorridorKeyRotoFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     ic->setEvaluateOnChange(false);
     page->addChild(*ic);
 
-    button(kRForget, "Forget roto", "Delete this node's tracking data from disk.");
+    button(kRForget, matte ? "Forget roto" : "Forget hint", "Delete this node's tracking data from disk.");
     button(kRReport, "Report a bug", "Opens a GitHub issue with the latest log lines filled in, and the log folder.");
 
     OFX::StringParamDescriptor* data = desc.defineStringParam(kRData);
-    data->setLabel("Roto data");
+    data->setLabel(matte ? "Roto data" : "Hint data");
     data->setIsSecret(true);
     data->setAnimates(false);
     data->setDefault("");
@@ -1063,11 +1236,30 @@ void CorridorKeyRotoFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     tick->setDefault(0);
 }
 
-OFX::ImageEffect* CorridorKeyRotoFactory::createInstance(OfxImageEffectHandle h, OFX::ContextEnum) {
-    return new CorridorKeyRoto(h);
+mDeclarePluginFactory(CorridorKeyHintFactory, {}, {});
+void CorridorKeyHintFactory::describe(OFX::ImageEffectDescriptor& d) { describeRoto(d, false); }
+void CorridorKeyHintFactory::describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) {
+    describeRotoInContext(d, false);
+}
+OFX::ImageEffect* CorridorKeyHintFactory::createInstance(OfxImageEffectHandle h, OFX::ContextEnum) {
+    return new CorridorKeyRoto(h, false);
 }
 
-OFX::PluginFactory* makeRotoFactory() {
-    static CorridorKeyRotoFactory p(kRotoId, 1, 2);
+mDeclarePluginFactory(CorridorKeyRotoMatteFactory, {}, {});
+void CorridorKeyRotoMatteFactory::describe(OFX::ImageEffectDescriptor& d) { describeRoto(d, true); }
+void CorridorKeyRotoMatteFactory::describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) {
+    describeRotoInContext(d, true);
+}
+OFX::ImageEffect* CorridorKeyRotoMatteFactory::createInstance(OfxImageEffectHandle h, OFX::ContextEnum) {
+    return new CorridorKeyRoto(h, true);
+}
+
+OFX::PluginFactory* makeRotoFactory() {  // the Hint node (its ID is still "...Roto": old projects keep working)
+    static CorridorKeyHintFactory p(kRotoId, 1, 3);
+    return &p;
+}
+
+OFX::PluginFactory* makeRotoMatteFactory() {
+    static CorridorKeyRotoMatteFactory p(kMatteId, 1, 0);
     return &p;
 }

@@ -754,6 +754,19 @@ JobStatus jobStatus(const std::string& c, const std::string& id, bool fresh) {
 // ------------------------------------------------------------------ roto
 
 std::string rotoRoot(const std::string& c) { return joinPath(c, "roto"); }
+std::string matteRoot(const std::string& c) { return joinPath(c, "rotomatte"); }
+bool isMatteRoot(const std::string& root) { return fs::path(root).filename() == "rotomatte"; }
+std::string rotoEnvPython(const EngineConfig& cfg) {
+#ifdef _WIN32
+    std::string p = joinPath(joinPath(joinPath(cfg.engine, "roto-env"), "Scripts"), "python.exe");
+#else
+    std::string p = joinPath(joinPath(joinPath(cfg.engine, "roto-env"), "bin"), "python");
+#endif
+    return fileExists(p) ? p : "";
+}
+static const char* kNoRotoEnv =
+    "The Roto models aren't installed. In ck2-gui: Setup -> Roto models; or run the plugin's installer "
+    "with --roto (Windows: -Roto), plus --matanyone for hair.";
 // Roto jobs use rotoRoot(cache) as their "cache" for the shared job functions.
 std::string previewMaskPath(const std::string& c, const std::string& id, int idx) {
     return joinPath(joinPath(joinPath(c, id), "preview"), numbered("mask", idx));
@@ -789,11 +802,20 @@ bool ensureRotoDaemon(const std::string& root, std::string* err) {
         if (err) *err = "roto_daemon.py not found next to " + cfg.path + " (run install.sh again)";
         return false;
     }
+    std::string py = cfg.python;
+    if (isMatteRoot(root)) {  // Roto node: SAM 3 / MatAnyone 2 live in their own environment
+        py = rotoEnvPython(cfg);
+        if (py.empty()) {
+            if (err) *err = kNoRotoEnv;
+            return false;
+        }
+    }
     makeDirs(root);
     writeTextAtomic(joinPath(root, "daemon.starting"), std::to_string(nowMs()));
-    std::vector<std::string> argv = {cfg.python, cfg.rotoScript, root, cfg.samModel};
+    std::vector<std::string> argv = {py, cfg.rotoScript, root, cfg.samModel};
     std::map<std::string, std::string> env = {{"PYTHONUNBUFFERED", "1"}, {"PYTORCH_ENABLE_MPS_FALLBACK", "1"},
                                               {"PATH", enginePath(cfg)}};
+    if (!cfg.hfToken.empty()) env["HF_TOKEN"] = cfg.hfToken;
     return spawnDetached(argv, env, root, err);
 }
 
@@ -817,10 +839,14 @@ bool openPicker(const std::string& root, const std::string& id, int idx, const s
         if (err) *err = "roto_picker.py not found next to " + cfg.path + " (run install.sh again)";
         return false;
     }
-    if (!ensureRotoDaemon(root, err)) return false;  // start loading SAM 2 right away
+    if (!ensureRotoDaemon(root, err)) return false;  // start loading SAM right away
     std::string dir = joinPath(root, id);
     writeTextAtomic(joinPath(dir, "picker.open"), "starting");
-    std::vector<std::string> argv = {cfg.python, cfg.pickerScript, dir, std::to_string(idx), cfg.rotoScript, model};
+    // The picker window runs in the engine's Python (PySide6); the helper it may restart
+    // runs in roto-env for the Roto node.
+    const bool matte = isMatteRoot(root);
+    std::vector<std::string> argv = {cfg.python, cfg.pickerScript, dir, std::to_string(idx), cfg.rotoScript, model,
+                                     matte ? "Roto" : "Hint", matte ? rotoEnvPython(cfg) : cfg.python};
     // Resolve's own library/Qt settings must not leak into the picker's Qt.
     std::map<std::string, std::string> env = {
         {"PATH", enginePath(cfg)},       {"LD_LIBRARY_PATH", kEnvUnset},   {"QT_PLUGIN_PATH", kEnvUnset},
@@ -874,7 +900,7 @@ bool startRotoTrackLocked(const std::string& root, const std::string& id, const 
                           int count, std::string* err) {
     std::string prompt;
     if (!readText(joinPath(dir, "prompts.json"), prompt)) {
-        if (err) *err = "press 'Pick character…' first";
+        if (err) *err = "press 'Pick…' first";
         return false;
     }
     std::error_code ec;
@@ -885,7 +911,17 @@ bool startRotoTrackLocked(const std::string& root, const std::string& id, const 
     std::string body = prompt.substr(prompt.find('{') + 1);
     std::ostringstream o;
     o << "{\"seq\": " << nowMs() << ", \"kind\": \"track\", \"first\": " << first << ", \"count\": " << count
-      << ", " << body;
+      << ", ";
+    if (isMatteRoot(root)) {  // Roto node: soft matte (MatAnyone 2 or SAM edges) + shapes keyed from the clip's start
+        std::string matte = "matanyone";
+        if (readText(joinPath(dir, "matte.txt"), matte)) matte.erase(matte.find_last_not_of(" \r\n") + 1);
+        int start = 0;
+        auto m = jobMem(root, id);
+        start = m->spec.start;
+        o << "\"matte\": \"" << (matte == "sam" ? "sam" : "matanyone") << "\", \"t0\": " << start
+          << ", \"max_side\": 1920, ";
+    }
+    o << body;
     writeTextAtomic(joinPath(dir, "launched"), std::to_string(first) + " " + std::to_string(count) + "\n");
     std::ofstream(joinPath(dir, "engine.log"), std::ios::app)
         << "[plugin] tracking requested for frames " << first << "-" << (first + count - 1) << "\n";
@@ -912,7 +948,7 @@ TrackStart requestTrack(const std::string& root, const std::string& id, std::str
     };
     if (!m->loaded) return fail("roto job missing");
     std::string prompt;
-    if (!readText(joinPath(dir, "prompts.json"), prompt)) return fail("press 'Pick character…' first");
+    if (!readText(joinPath(dir, "prompts.json"), prompt)) return fail("press 'Pick…' first");
     std::error_code ec;
     if (fileExists(joinPath(dir, "launched")) && !fileExists(joinPath(dir, "exitcode"))) {
         if (rotoDaemonAlive(root)) return fail("already tracking; press Stop first");

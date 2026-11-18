@@ -6,6 +6,8 @@ Usually run for you by the ck2-gui app (Setup -> DCC plugins). By hand:
   powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
 
 Options: -Engine DIR  -Ffmpeg PATH  -NoSam  -ConnectOnly  -Uninstall
+         -Roto (Roto models, own environment)  -MatAnyone (hair; NON-COMMERCIAL licence, asks first)
+         -AcceptMatAnyoneLicense  -HfToken TOKEN (for SAM 3, gated by Meta)
 Copying into "C:\Program Files\Common Files\OFX\Plugins" asks once for permission (UAC).
 #>
 param(
@@ -14,6 +16,10 @@ param(
     [switch]$NoSam,
     [switch]$ConnectOnly,
     [switch]$Uninstall,
+    [switch]$Roto,
+    [switch]$MatAnyone,
+    [switch]$AcceptMatAnyoneLicense,
+    [string]$HfToken = "",
     [switch]$Gui            # accepted for symmetry with install.sh (UAC is always a dialog)
 )
 $ErrorActionPreference = "Stop"
@@ -101,6 +107,12 @@ function Connect {
     New-Item -ItemType Directory -Force -Path $ConfDir, $CacheDir, $TempDir | Out-Null
     Copy-Item (Join-Path $Here "support\roto_daemon.py") $ConfDir -Force
     Copy-Item (Join-Path $Here "support\roto_picker.py") $ConfDir -Force
+    Copy-Item (Join-Path $Here "support\ck2_masks.py") $ConfDir -Force
+    Copy-Item (Join-Path $Here "support\setup_roto_env.py") $ConfDir -Force
+    # settings added by hand (or by ck2-gui) survive reconnecting
+    $keep = @()
+    if (Test-Path $Conf) { $keep = @(Get-Content $Conf | Where-Object { $_ -match '^(hf_token|auto_refresh)=' }) }
+    if ($HfToken) { $keep = @($keep | Where-Object { $_ -notmatch '^hf_token=' }) + "hf_token=$HfToken" }
     $ff = $Ffmpeg
     if (-not $ff -or -not (Test-Path $ff)) {
         $cmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
@@ -119,6 +131,7 @@ function Connect {
         "sam_model=$SamModel"
     )
     if ($ff) { $lines += "ffmpeg=$ff" }
+    $lines += $keep
     Write-Utf8NoBom $Conf $lines
     Ok "Connected: wrote $Conf"
 }
@@ -153,31 +166,53 @@ New-Item -ItemType Directory -Force -Path $MacroDir | Out-Null
 Copy-Item (Join-Path $Here "fusion\CorridorKey Outputs.setting") $MacroDir -Force
 Ok "Fusion macro: $MacroDir"
 
-# ---------------------------------------------------------------- PySide6 for the Roto picker
+# ---------------------------------------------------------------- Roto models (own environment)
+if ($Roto -or $MatAnyone) {
+    $maArgs = @()
+    if ($MatAnyone) {
+        & $Py -c "import sys; sys.path.insert(0, r'$(Join-Path $Here 'support')'); import setup_roto_env as s; print(s.LICENSE_NOTE)"
+        $accept = $AcceptMatAnyoneLicense
+        if (-not $accept) {
+            $a = Read-Host "Install MatAnyone 2 under this NON-COMMERCIAL licence? [y/N]"
+            $accept = $a -match '^[yY]'
+        }
+        if ($accept) { $maArgs = @("--matanyone", "--accept-matanyone-license") }
+        else { Write-Host "   MatAnyone 2 skipped: the Roto node uses SAM edges." }
+    }
+    Say "Installing the Roto models into $Engine\roto-env (a few GB the first time)"
+    $uv = Get-Command uv -ErrorAction SilentlyContinue
+    $uvArgs = if ($uv) { @("--uv", $uv.Source) } else { @() }
+    $code = Run-Native { & $Py (Join-Path $Here "support\setup_roto_env.py") --engine $Engine @uvArgs @maArgs }
+    if ($code -ne 0) { Die "Installing the Roto models failed (see above)." }
+    Ok "Roto models ready"
+}
+
+# ---------------------------------------------------------------- PySide6 for the picker window
 if ((Run-Native { & $Py -c "import PySide6" *> $null }) -ne 0) {
-    Say "Adding PySide6 to the engine's Python (for the Roto picker window)"
+    Say "Adding PySide6 to the engine's Python (for the picker window)"
     $uv = Get-Command uv -ErrorAction SilentlyContinue
     $code = if ($uv) { Run-Native { & $uv.Source pip install --python $Py "PySide6>=6.7" } }
             else     { Run-Native { & $Py -m pip install "PySide6>=6.7" } }
-    if ($code -ne 0) { Write-Host "   warning: PySide6 install failed - the Roto picker won't open" }
+    if ($code -ne 0) { Write-Host "   warning: PySide6 install failed - the picker won't open" }
 }
 
 # ---------------------------------------------------------------- SAM 2 model
 if (-not $NoSam) {
     if ((Run-Native { & $Py -c "import transformers; transformers.Sam2VideoModel" *> $null }) -eq 0) {
-        Say "Downloading $SamModel for the Roto node (once, ~0.9 GB)"
+        Say "Downloading $SamModel for the Hint node (once, ~0.9 GB)"
         $samLog = Join-Path $ConfDir "sam_download.log"
         $code = Run-Native { & $Py -c "from huggingface_hub import snapshot_download as d; d('$SamModel')" 2> $samLog }
         if ($code -eq 0) { Ok "SAM 2 model ready" }
-        else { Write-Host "   warning: couldn't download $SamModel now; the Roto node will try on first use" }
+        else { Write-Host "   warning: couldn't download $SamModel now; the Hint node will try on first use" }
     } else {
-        Write-Host "   warning: this engine's transformers has no SAM 2 (the Roto node needs transformers>=4.56)"
+        Write-Host "   warning: this engine's transformers has no SAM 2 (the Hint node needs transformers>=4.56)"
     }
 }
 
 Write-Host ""
 Write-Host "Done. Next:"
 Write-Host "  1. Restart DaVinci Resolve."
-Write-Host "  2. Effects -> OpenFX -> Keying: CorridorKey 2.0, CorridorKey Pass, CorridorKey Roto."
-Write-Host "  3. Press 'Key clip' in the Inspector, then play the clip once."
+Write-Host "  2. Effects -> OpenFX -> Keying: CorridorKey 2.0, CorridorKey Pass, CorridorKey Hint,"
+Write-Host "     CorridorKey Roto (Roto needs: install.ps1 -Roto [-MatAnyone])."
+Write-Host "  3. Press 'Key clip' in the Inspector; it reads the clip's frames by itself."
 exit 0

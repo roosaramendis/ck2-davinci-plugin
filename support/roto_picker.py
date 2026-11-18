@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Picker window for the CorridorKey Roto node (PySide6, runs in the engine venv).
+"""Picker window for the CorridorKey Hint and Roto nodes (PySide6, runs in the engine venv).
 
-Opened by the node's "Pick character…" button on the current frame:
-    roto_picker.py <job dir> <frame index> <roto_daemon.py> <sam model>
+Opened by the node's "Pick…" button on the current frame:
+    roto_picker.py <job dir> <frame index> <roto_daemon.py> <sam model> [<node name> <helper python>]
 
-  click            keep this (adds a point to the selected object)
-  right-click      remove this (Ctrl/Alt+click too)
-  drag             rectangle around a character/area = a new object
+Tools (P / B / L):
+  Point   click: keep this · right-click (or Alt+click): remove this · drag: a box
+  Box     drag a rectangle around something = a new object
+  Lasso   draw around an area: adds it · Alt+draw or right-drag: cuts it away
+          "Exact edge" on: the edge is where you drew; off: SAM finds the edge inside
   wheel / middle   zoom / pan, double-middle-click fits
   Ctrl+Z           undo
 
@@ -23,12 +25,14 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import (QBrush, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap,
-                           QShortcut)
-from PySide6.QtWidgets import (QApplication, QGraphicsEllipseItem, QGraphicsPixmapItem,
+from PySide6.QtGui import (QBrush, QColor, QImage, QKeySequence, QPainter, QPainterPath, QPen,
+                           QPixmap, QPolygonF, QShortcut)
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QGraphicsEllipseItem,
+                               QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsPolygonItem,
                                QGraphicsRectItem, QGraphicsScene, QGraphicsSimpleTextItem,
                                QGraphicsView, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-                               QMainWindow, QMessageBox, QPushButton, QVBoxLayout, QWidget)
+                               QMainWindow, QMessageBox, QPushButton, QToolButton, QVBoxLayout,
+                               QWidget)
 
 COLORS = ["#3ddc84", "#4fc3f7", "#ffd54f", "#ff8a65", "#ba68c8", "#4db6ac", "#f06292", "#aed581"]
 
@@ -76,6 +80,10 @@ class View(QGraphicsView):
         self.press = None   # scene pos of the left press
         self.band = None
         self.fit_mode = True
+        self.tool = "point"  # point | box | lasso
+        self.lasso = None    # points being drawn
+        self.lasso_op = 1
+        self.lasso_item = None
 
     def set_frame(self, pix: QPixmap):
         self.frame_item.setPixmap(pix)
@@ -110,14 +118,27 @@ class View(QGraphicsView):
                                Qt.PenStyle.SolidLine if sel else Qt.PenStyle.DashLine))
                 self.scene().addItem(it)
                 self.marks.append(it)
+            for rg in ob.get("regions", []):
+                it = QGraphicsPolygonItem(QPolygonF([QPointF(x, y) for x, y in rg["poly"]]))
+                c = QColor(col) if rg.get("op", 1) else QColor("#ff3b3b")
+                fill = QColor(c)
+                fill.setAlpha(50)
+                it.setBrush(QBrush(fill))
+                pen = QPen(c, 3 if sel else 2,
+                           Qt.PenStyle.SolidLine if rg.get("exact", True) else Qt.PenStyle.DashLine)
+                pen.setCosmetic(True)
+                it.setPen(pen)
+                self.scene().addItem(it)
+                self.marks.append(it)
             for x, y, lab in ob.get("points", []):
                 it = QGraphicsEllipseItem(x - r, y - r, 2 * r, 2 * r)
                 it.setBrush(QBrush(col if lab else QColor("#ff3b3b")))
                 it.setPen(QPen(QColor("white" if sel else "#222"), r / 3))
                 self.scene().addItem(it)
                 self.marks.append(it)
-            if ob.get("box") or ob.get("points"):
-                x, y = (ob["box"][0], ob["box"][1]) if ob.get("box") else ob["points"][0][:2]
+            if ob.get("box") or ob.get("points") or ob.get("regions"):
+                x, y = (ob["box"][0], ob["box"][1]) if ob.get("box") else \
+                    ob["points"][0][:2] if ob.get("points") else ob["regions"][0]["poly"][0]
                 t = QGraphicsSimpleTextItem(str(i + 1))
                 t.setBrush(col)
                 t.setScale(max(1.0, r / 4))
@@ -143,15 +164,37 @@ class View(QGraphicsView):
             return super().mousePressEvent(fake)
         if not self.frame_item.contains(p):
             return
+        alt = bool(e.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier))
+        if self.tool == "lasso" and e.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+            self.lasso = [p]
+            self.lasso_op = 0 if (alt or e.button() == Qt.MouseButton.RightButton) else 1
+            self.lasso_item = QGraphicsPathItem()
+            pen = QPen(QColor("#ffd54f" if self.lasso_op else "#ff3b3b"), 2)
+            pen.setCosmetic(True)
+            self.lasso_item.setPen(pen)
+            self.scene().addItem(self.lasso_item)
+            return
         if e.button() == Qt.MouseButton.RightButton:
-            self.win.add_point(p.x(), p.y(), 0)
+            if self.tool == "point":
+                self.win.add_point(p.x(), p.y(), 0)
         elif e.button() == Qt.MouseButton.LeftButton:
-            if e.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
+            if alt and self.tool == "point":
                 self.win.add_point(p.x(), p.y(), 0)
             else:
                 self.press = p
 
     def mouseMoveEvent(self, e):
+        if self.lasso is not None:
+            p = self.mapToScene(e.position().toPoint())
+            r = self.frame_item.boundingRect()
+            p = QPointF(min(max(p.x(), r.left()), r.right()), min(max(p.y(), r.top()), r.bottom()))
+            if (p - self.lasso[-1]).manhattanLength() * self.transform().m11() >= 3:
+                self.lasso.append(p)
+                path = QPainterPath(self.lasso[0])
+                for q in self.lasso[1:]:
+                    path.lineTo(q)
+                self.lasso_item.setPath(path)
+            return
         if self.press is not None:
             p = self.mapToScene(e.position().toPoint())
             d = (p - self.press)
@@ -166,6 +209,15 @@ class View(QGraphicsView):
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
+        if self.lasso is not None:
+            pts, op = self.lasso, self.lasso_op
+            self.scene().removeItem(self.lasso_item)
+            self.lasso = self.lasso_item = None
+            if len(pts) >= 3:
+                poly = QPolygonF(pts)
+                if poly.boundingRect().width() > 3 and poly.boundingRect().height() > 3:
+                    self.win.add_region([[round(q.x(), 1), round(q.y(), 1)] for q in pts], op)
+            return
         if self.press is not None and e.button() == Qt.MouseButton.LeftButton:
             if self.band is not None:
                 rect = self.band.rect().intersected(self.frame_item.boundingRect())
@@ -173,7 +225,7 @@ class View(QGraphicsView):
                 self.band = None
                 if rect.width() > 4 and rect.height() > 4:
                     self.win.add_box(rect.left(), rect.top(), rect.right(), rect.bottom())
-            else:
+            elif self.tool == "point":
                 self.win.add_point(self.press.x(), self.press.y(), 1)
             self.press = None
             return
@@ -194,26 +246,47 @@ class View(QGraphicsView):
 
 
 class Picker(QMainWindow):
-    def __init__(self, job: Path, frame: int, daemon: str, model: str):
+    def __init__(self, job: Path, frame: int, daemon: str, model: str, node: str = "Hint",
+                 helper_python: str | None = None):
         super().__init__()
         self.job, self.frame, self.daemon, self.model = job, frame, daemon, model
+        self.node = node
+        self.helper_python = helper_python or sys.executable
         self.pv = job / "preview"
         self.objects: list[dict] = []
         self.current = -1
         self.history: list[str] = []
         self.wait_seq = 0
         self.asked_at = 0.0
-        self.setWindowTitle(f"CorridorKey Roto – pick what to keep (frame {frame})")
+        self.setWindowTitle(f"CorridorKey {node} – pick what to keep (frame {frame})")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
 
         self.view = View(self)
         side = QVBoxLayout()
-        help_ = QLabel("<b>Click</b> on the character to keep it.<br>"
-                       "<b>Right-click</b> on things to remove.<br>"
-                       "<b>Drag</b> a rectangle around a character or area (each rectangle is "
-                       "its own object).<br>Wheel: zoom · middle-drag: pan · Ctrl+Z: undo")
-        help_.setWordWrap(True)
-        side.addWidget(help_)
+        tools = QHBoxLayout()
+        self.tool_group = QButtonGroup(self)
+        for key, name, tip in (("point", "Point", "Click: keep · right-click: remove · drag: box (P)"),
+                               ("box", "Box", "Drag a rectangle: a new object (B)"),
+                               ("lasso", "Lasso", "Draw around an area: add it · Alt or right-drag: cut it away (L)")):
+            b = QToolButton()
+            b.setText(name)
+            b.setToolTip(tip)
+            b.setCheckable(True)
+            b.setChecked(key == "point")
+            b.setMinimumWidth(80)
+            b.clicked.connect(lambda _=False, k=key: self.set_tool(k))
+            self.tool_group.addButton(b)
+            tools.addWidget(b)
+            setattr(self, f"b_{key}", b)
+        side.addLayout(tools)
+        self.exact = QCheckBox("Lasso: exact edge")
+        self.exact.setChecked(True)
+        self.exact.setToolTip("On: the edge is exactly where you drew.\n"
+                              "Off: SAM finds the edge inside what you drew (dashed).")
+        side.addWidget(self.exact)
+        self.help_ = QLabel()
+        self.help_.setWordWrap(True)
+        side.addWidget(self.help_)
         side.addWidget(QLabel("Objects (clicks go to the selected one):"))
         self.list = QListWidget()
         self.list.currentRowChanged.connect(self.select)
@@ -250,17 +323,21 @@ class Picker(QMainWindow):
         self.setCentralWidget(w)
         self.resize(1400, 820)
         QShortcut(QKeySequence.StandardKey.Undo, self, activated=self.undo)
+        QShortcut(QKeySequence("P"), self, activated=lambda: self.set_tool("point"))
+        QShortcut(QKeySequence("B"), self, activated=lambda: self.set_tool("box"))
+        QShortcut(QKeySequence("L"), self, activated=lambda: self.set_tool("lasso"))
+        self.set_tool("point")
 
         pix = QPixmap(str(self.pv / f"view_{frame:06d}.ppm"))
         if pix.isNull():
-            QMessageBox.critical(self, "CorridorKey Roto", "The frame image is missing. "
-                                 "Press 'Pick character…' in Resolve again.")
+            QMessageBox.critical(self, f"CorridorKey {self.node}", "The frame image is missing. "
+                                 "Press 'Pick…' in Resolve again.")
             QTimer.singleShot(0, self.close)
             return
         self.view.set_frame(pix)
         old = read_json(self.job / "prompts.json")  # continue an earlier selection on this frame
         if old and int(old.get("frame", -1)) == frame:
-            self.objects = old.get("objects", [])
+            self.objects = [dict({"points": [], "box": None, "regions": []}, **o) for o in old.get("objects", [])]
             self.current = len(self.objects) - 1
             self.refresh_list()
             self.ask()
@@ -270,7 +347,7 @@ class Picker(QMainWindow):
         self.beat = QTimer(self, interval=2000, timeout=self.heartbeat)
         self.beat.start()
         self.heartbeat()
-        self.set_status("Click on what you want to keep, or drag a rectangle around it.")
+        self.set_status("Click on what you want to keep, drag a rectangle, or draw a lasso around it.")
 
     # ---------------------------------------------------------------- editing
     def snapshot(self):
@@ -291,20 +368,45 @@ class Picker(QMainWindow):
                 self.set_status("First click on (or drag around) something to keep.")
                 return
             if self.current < 0 or not self.objects:
-                self.objects.append({"points": [], "box": None})
+                self.objects.append({"points": [], "box": None, "regions": []})
                 self.current = len(self.objects) - 1
         self.objects[self.current]["points"].append([round(x, 1), round(y, 1), label])
         self.changed()
 
     def add_box(self, x0, y0, x1, y1):
         self.snapshot()
-        self.objects.append({"points": [], "box": [round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)]})
+        self.objects.append({"points": [], "box": [round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)],
+                             "regions": []})
         self.current = len(self.objects) - 1
+        self.changed()
+
+    def set_tool(self, key: str):
+        self.view.tool = key
+        getattr(self, f"b_{key}").setChecked(True)
+        self.help_.setText({
+            "point": "<b>Click</b> on what to keep · <b>right-click</b> on things to remove · "
+                     "<b>drag</b> for a box.",
+            "box": "<b>Drag</b> a rectangle around something: each rectangle is its own object.",
+            "lasso": "<b>Draw</b> around an area to add it · <b>Alt+draw</b> or <b>right-drag</b> to cut "
+                     "it away. Goes to the selected object."}[key]
+            + "<br>Wheel: zoom · middle-drag: pan · Ctrl+Z: undo")
+
+    def add_region(self, poly, op):
+        self.snapshot()
+        if self.current < 0 or self.current >= len(self.objects):
+            if op == 0 and not self.objects:
+                self.history.pop()
+                self.set_status("First add something to keep, then cut parts away.")
+                return
+            self.objects.append({"points": [], "box": None, "regions": []})
+            self.current = len(self.objects) - 1
+        self.objects[self.current].setdefault("regions", []).append(
+            {"poly": poly, "op": int(op), "exact": self.exact.isChecked()})
         self.changed()
 
     def new_object(self):
         self.snapshot()
-        self.objects.append({"points": [], "box": None})
+        self.objects.append({"points": [], "box": None, "regions": []})
         self.current = len(self.objects) - 1
         self.changed(ask=False)
         self.set_status(f"Object {self.current + 1}: click on it or drag a rectangle around it.")
@@ -328,7 +430,8 @@ class Picker(QMainWindow):
 
     def changed(self, ask=True):
         # drop empty objects except the selected one
-        keep = [i for i, o in enumerate(self.objects) if o["points"] or o["box"] or i == self.current]
+        keep = [i for i, o in enumerate(self.objects)
+                if o["points"] or o["box"] or o.get("regions") or i == self.current]
         cur = self.objects[self.current] if 0 <= self.current < len(self.objects) else None
         self.objects = [self.objects[i] for i in keep]
         self.current = self.objects.index(cur) if cur in self.objects else len(self.objects) - 1
@@ -343,8 +446,11 @@ class Picker(QMainWindow):
         for i, ob in enumerate(self.objects):
             keep = sum(1 for p in ob["points"] if p[2])
             rem = sum(1 for p in ob["points"] if not p[2])
+            add = sum(1 for r in ob.get("regions", []) if r["op"])
+            cut = sum(1 for r in ob.get("regions", []) if not r["op"])
             parts = (["rectangle"] if ob["box"] else []) + ([f"{keep} keep"] if keep else []) + \
-                    ([f"{rem} remove"] if rem else [])
+                    ([f"{rem} remove"] if rem else []) + ([f"{add} lasso"] if add else []) + \
+                    ([f"{cut} cut"] if cut else [])
             it = QListWidgetItem(f"Object {i + 1}: " + (", ".join(parts) or "empty"))
             it.setForeground(QColor(COLORS[i % len(COLORS)]))
             self.list.addItem(it)
@@ -355,13 +461,14 @@ class Picker(QMainWindow):
         self.view.draw_marks(self.objects, self.current)
 
     def usable(self):
-        return [o for o in self.objects if o["box"] or any(p[2] for p in o["points"])]
+        return [o for o in self.objects
+                if o["box"] or any(p[2] for p in o["points"]) or any(r["op"] for r in o.get("regions", []))]
 
     # ---------------------------------------------------------------- SAM preview
     def ask(self):
         if not self.usable():
             self.view.set_mask(None)
-            self.set_status("Nothing to keep yet: click on the character or drag a rectangle.")
+            self.set_status("Nothing to keep yet: click on something, drag a rectangle or draw a lasso.")
             return
         self.ensure_daemon()
         self.wait_seq = int(time.time() * 1000)
@@ -379,7 +486,7 @@ class Picker(QMainWindow):
             secs = time.time() - self.asked_at
             if secs > 4:
                 self.set_status(f"Working out the mask… {secs:.0f} s"
-                                + ("  (first time: SAM 2 is loading)" if secs > 8 else ""))
+                                + ("  (first time: SAM is loading)" if secs > 8 else ""))
             return
         self.wait_seq = 0
         if done.get("error"):
@@ -403,7 +510,7 @@ class Picker(QMainWindow):
             return
         atomic_write(root / "daemon.starting", str(time.time()))
         kw = {"start_new_session": True} if os.name != "nt" else {"creationflags": 0x00000008}
-        subprocess.Popen([sys.executable, self.daemon, str(root), self.model], cwd=str(root),
+        subprocess.Popen([self.helper_python, self.daemon, str(root), self.model], cwd=str(root),
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, **kw)
 
@@ -417,8 +524,8 @@ class Picker(QMainWindow):
     def use(self):
         objs = self.usable()
         if not objs:
-            QMessageBox.information(self, "CorridorKey Roto",
-                                    "Click on the character or drag a rectangle around it first.")
+            QMessageBox.information(self, f"CorridorKey {self.node}",
+                                    "Click on something, drag a rectangle or draw a lasso around it first.")
             return
         atomic_write(self.job / "prompts.json",
                      json.dumps({"frame": self.frame, "objects": objs, "model": self.model}))
@@ -437,10 +544,12 @@ class Picker(QMainWindow):
 
 def main():
     job, frame, daemon, model = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
+    node = sys.argv[5] if len(sys.argv) > 5 else "Hint"
+    helper = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else None
     sys.stderr = open(job / "picker.log", "a", buffering=1)
     sys.stdout = sys.stderr
     app = QApplication(sys.argv[:1])
-    app.setApplicationName("CorridorKey Roto")
+    app.setApplicationName(f"CorridorKey {node}")
     app.setStyle("Fusion")
     from PySide6.QtGui import QPalette
     pal = QPalette()
@@ -451,7 +560,7 @@ def main():
                       (QPalette.ColorRole.HighlightedText, "#ffffff")):
         pal.setColor(role, QColor(col))
     app.setPalette(pal)
-    w = Picker(job, frame, daemon, model)
+    w = Picker(job, frame, daemon, model, node, helper)
     w.show()
     w.raise_()
     w.activateWindow()

@@ -16,7 +16,8 @@ playback and scrubbing are instant.
 | **CorridorKey 2.0** | Keys the clip (in the background) and outputs one pass: cutout, matte, foreground or checker. |
 | **CorridorKey Pass** | Outputs one pass of a key, found by its **Key name**. Use several to get several passes at once; nothing is keyed twice. |
 | **CorridorKey Outputs** (Fusion macro) | One node with **Cutout / Alpha / Foreground / Checker** outputs, built from four Pass nodes. Fusion page only. |
-| **CorridorKey Roto** | Click-to-track roto with SAM 2.1: click / drag rectangles on whatever you want to keep (people, props, areas) in a picker window, it tracks them through the clip and outputs a **hint matte** for CorridorKey's Hint input, or the **source with everything else filled with screen colour**. |
+| **CorridorKey Hint** | A quick helper matte for keying: pick what you want to keep (points, boxes, lassos), SAM 2.1 tracks it through the clip, and it outputs a **hint matte** for CorridorKey's Hint input, or the **source with everything else filled with screen colour**. Not meant as final roto. |
+| **CorridorKey Roto** | Real roto without a green screen: the same picking, then SAM tracks it and **MatAnyone 2** (optional) makes soft edges for hair and motion blur. Outputs the **cutout** or the **matte**, and **editable shapes for Fusion**. Needs the Roto models (see Install). |
 
 An OpenFX node can only have one output, so several passes come from Pass nodes
 (or the macro, which bundles them).
@@ -48,8 +49,21 @@ Apple GPU, not the MLX port.
 | choose the engine | `--engine DIR` | `-Engine DIR` |
 | engine moved: only rewrite the config | `--connect-only` | `-ConnectOnly` |
 | skip the SAM 2 download | `--no-sam` | `-NoSam` |
+| set up the Roto node's models | `--roto` | `-Roto` |
+| …with MatAnyone 2 soft edges (asks you to accept its licence) | `--matanyone` | `-MatAnyone` |
+| Hugging Face token for SAM 3 | `--hf-token TOKEN` | `-HfToken TOKEN` |
 | remove the plugin | `--uninstall` | `-Uninstall` |
 | compile instead of using the ready-made plugin | `--build` | – |
+
+**Roto models.** The Roto node runs in its own Python environment
+(`roto-env` in the engine folder) because SAM 3 needs a newer `transformers`
+than the engine allows. `--roto` creates it (a few GB, with PyTorch for your
+GPU). `--matanyone` adds MatAnyone 2 for soft edges: it is made by S-Lab (NTU)
+under the **NTU S-Lab License 1.0, free for non-commercial use only**; the
+installer shows the licence and asks before downloading. **SAM 3** is gated by
+Meta: request access on [huggingface.co/facebook/sam3](https://huggingface.co/facebook/sam3)
+with a free account, create a read token, and pass it with `--hf-token` (or add
+`hf_token=...` to the config file). SAM 2.1 needs none of this.
 
 Compiling (`--build`, or a source checkout without `prebuilt/`) needs `cmake`,
 `git` and a C++ compiler; on a Mac, `xcode-select --install` and
@@ -121,29 +135,34 @@ rename it.
 - **Fusion page:** *Add Tool → Macros → CorridorKey Outputs*, then type the key
   name once. The node has Cutout, Alpha, Foreground and Checker outputs.
 
-### Keep only what you want: CorridorKey Roto
+### Help the key: CorridorKey Hint
 
-Use it to keep anything in the shot (people, props, a car, a whole area) and
-drop the rest.
+A quick, tracked helper matte that tells CorridorKey what to keep (anything:
+people, props, a car, an area). It isn't final roto; for that, see
+**CorridorKey Roto** below.
 
-1. Wire it up. The clip goes into **both** nodes: MediaIn → **CorridorKey Roto**,
-   and MediaIn → **CorridorKey 2.0**. The Roto output goes into CorridorKey's
+1. Wire it up. The clip goes into **both** nodes: MediaIn → **CorridorKey Hint**,
+   and MediaIn → **CorridorKey 2.0**. The Hint output goes into CorridorKey's
    **Hint** input (the second, green triangle).
 2. Go to a frame where what you want to keep is clearly visible and press
-   **Pick character…** (it works for any object, not only characters). A
-   window opens on that frame. The frame is taken when the viewer draws it, so
-   the Roto node (or the CorridorKey node after it) must be in the viewer:
-   - **click** on something to keep it,
-   - **right-click** on things to remove (a light stand, a crew member, a rig),
-   - **drag** a rectangle around an object or area; each rectangle is its own
-     object, so add as many as you need,
+   **Pick…**. A window opens on that frame. The frame is taken when the viewer
+   draws it, so the Hint node (or the CorridorKey node after it) must be in the
+   viewer. Choose a tool at the top (or press its key):
+   - **Point (P):** click on something to keep it, right-click on things to
+     remove (a light stand, a crew member, a rig);
+   - **Box (B):** drag a rectangle around an object or area; each rectangle is
+     its own object, so add as many as you need;
+   - **Lasso (L):** draw around an area to add it, **Alt-drag or right-drag**
+     to cut an area away. With **Lasso: exact edge** ticked, the lasso's own
+     outline is used as it is; untick it to let SAM find the real edge inside
+     the lasso;
    - wheel zooms, middle-drag pans, Ctrl+Z undoes.
 
    After each change the mask is shown in red after a moment; the first time
-   takes longer while SAM 2 loads. Press **Use this selection** when it's right.
+   takes longer while SAM loads. Press **Use this selection** when it's right.
 3. Press **Track clip**. The node reads the clip's frames by itself (keep it, or
    the CorridorKey node after it, in the viewer), then tracking runs in the
-   background (`ROTO: TRACKING 40%`). It only needs the frames that actually
+   background (`HINT: TRACKING 40%`). It only needs the frames that actually
    play (a clip cut shorter in the edit is fine). If the banner asks you to
    play the clip instead, play it once; if it waits for more, let playback loop
    back to the start, or press **Track captured frames now**. If you pick again
@@ -151,12 +170,36 @@ drop the rest.
 4. **Output** (default **Hint matte**). **Overlay** shows the mask over the
    picture to check it. **Garbage-filled source** fills everything outside the
    picked objects with screen colour; use it on the Edit/Color page, where there's no
-   Hint input, by putting CorridorKey 2.0 *after* the Roto node.
-5. Wait for **✓ Tracked** in the Roto status (it updates by itself, and you
+   Hint input, by putting CorridorKey 2.0 *after* the Hint node.
+5. Wait for **✓ Tracked** in the Hint status (it updates by itself, and you
    get a desktop notification), *then* press Key clip on the CorridorKey node.
 
 With a Hint connected, **Hint is: First frame only** gives CorridorKey just the
 first frame's matte and lets it carry it forward.
+
+Projects made with the old "CorridorKey Roto" node open with the Hint node:
+it's the same node under its new name.
+
+### Roto without a green screen: CorridorKey Roto
+
+Needs the Roto models (`--roto`, or ck2-gui: **Setup → Roto models**).
+
+1. MediaIn → **CorridorKey Roto**. Pick and track exactly as with the Hint node
+   (**Pick…**, then **Track clip**).
+2. **Edges** (used by the next Track clip):
+   - **MatAnyone 2:** soft edges with hair detail and motion blur. Free for
+     non-commercial use only (NTU S-Lab License 1.0). If it isn't installed,
+     the node uses SAM's edges and says so.
+   - **SAM only:** solid edges, no extra licence.
+3. **Model:** SAM 2.1 (Large is best) or **SAM 3** (newest; needs a Hugging Face
+   token, see Install).
+4. **Output:** **Cutout** (the clip with the matte as alpha, straight colour),
+   **Matte** (black and white), **Overlay** (to check it) or **Source**.
+5. **Save shapes for Fusion** writes the tracked objects as keyframed Polygon
+   masks (`CorridorKey Roto <id>.setting`) to the **Shapes folder** and opens
+   it. Drag the file into Fusion's node editor to fix the roto by hand. Shapes
+   have solid edges: the hair stays in the matte, so a common setup is the
+   node's matte for the hair, and the shapes to clean up the body.
 
 ### Settings (used by the next Key clip)
 
@@ -205,9 +248,11 @@ accepts this, so:
 
 ## Where things are kept
 
-The Roto node runs SAM 2 in a background helper (`roto_daemon.py`, in the engine's
-Python). It starts when needed and quits after 5 idle minutes to free GPU
-memory. Its data is in the `roto/` folder of the cache.
+The Hint and Roto nodes run SAM in a background helper (`roto_daemon.py`: the
+Hint node in the engine's Python, the Roto node in `roto-env`). It starts when
+needed and quits after 5 idle minutes to free GPU memory. Their data is in the
+`roto/` (Hint) and `rotomatte/` (Roto) folders of the cache; saved shapes go to
+`shapes/` unless you choose another folder.
 
 Keys are cached as EXRs in `~/.cache/corridorkey-ofx` on Linux,
 `~/Library/Caches/corridorkey-ofx` on macOS, and `%LOCALAPPDATA%\corridorkey-ofx`
@@ -235,3 +280,8 @@ CorridorKey is © Corridor Digital under the Corridor Key Licence 2.0: free to
 use, and derivatives must also be free and keep the CorridorKey name. This
 plugin only runs the engine you installed; it doesn't include the model or its
 weights.
+
+SAM 2.1 and SAM 3 are Meta's (SAM 2.1: Apache 2.0; SAM 3: the SAM Licence,
+gated on Hugging Face). MatAnyone 2 is S-Lab's (NTU S-Lab License 1.0,
+non-commercial). None of them is bundled: they're downloaded when you install
+the Roto models, and MatAnyone 2 only after you accept its licence.

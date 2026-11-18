@@ -12,6 +12,8 @@
 #pragma once
 
 #include <string>
+
+#include "engine.h"
 #include <vector>
 
 namespace ck {
@@ -67,6 +69,9 @@ void forgetJob(const std::string& cacheDir, const std::string& id);
 // ------------------------------------------------------------------ roto (SAM 2)
 // Roto jobs live in <cache>/roto/<id>/ and are handled by roto_daemon.py.
 std::string rotoRoot(const std::string& cacheDir);
+std::string matteRoot(const std::string& cacheDir);  // the Roto node's jobs (helper runs in roto-env)
+bool isMatteRoot(const std::string& root);
+std::string rotoEnvPython(const EngineConfig& cfg);  // <engine>/roto-env python ("" if not installed)
 bool ensureRotoDaemon(const std::string& rotoRoot, std::string* err);
 // Opens the picker window (frame image already written by the node).
 bool openPicker(const std::string& rotoRoot, const std::string& id, int idx, const std::string& model,

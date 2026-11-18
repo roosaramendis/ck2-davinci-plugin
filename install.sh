@@ -8,7 +8,10 @@
 #   bash install.sh --ffmpeg PATH        ffmpeg for the engine (default: the one on PATH)
 #   bash install.sh --gui                ask for the password with a dialog (no terminal)
 #   bash install.sh --connect-only       only (re)write the config (engine moved)
-#   bash install.sh --no-sam             skip downloading the SAM 2 model (Roto node)
+#   bash install.sh --no-sam             skip downloading the SAM 2 model (Hint node)
+#   bash install.sh --roto               also install the Roto models (SAM 3 support, own environment)
+#   bash install.sh --roto --matanyone   ... plus MatAnyone 2 for hair (NON-COMMERCIAL licence, asks first)
+#   bash install.sh --hf-token TOKEN     Hugging Face token for SAM 3 (gated by Meta)
 #   bash install.sh --uninstall          remove the plugin from Resolve's OFX folder
 set -euo pipefail
 
@@ -61,7 +64,7 @@ as_admin() {
 }
 q() { printf '%q' "$1"; }   # quote a path for as_admin
 
-ENGINE="" MODE=full BUILD_FROM_SOURCE=0 SAM=1 GUI=0 FFMPEG=""
+ENGINE="" MODE=full BUILD_FROM_SOURCE=0 SAM=1 GUI=0 FFMPEG="" ROTO=0 MATANYONE=0 MA_ACCEPT=0 HF_TOKEN_ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --engine) ENGINE="${2:-}"; shift 2 ;;
@@ -72,7 +75,11 @@ while [[ $# -gt 0 ]]; do
         --no-sam) SAM=0; shift ;;
         --connect-only) MODE=connect; shift ;;
         --uninstall) MODE=uninstall; shift ;;
-        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+        --roto) ROTO=1; shift ;;
+        --matanyone) ROTO=1; MATANYONE=1; shift ;;
+        --accept-matanyone-license) MA_ACCEPT=1; shift ;;
+        --hf-token) HF_TOKEN_ARG="${2:-}"; shift 2 ;;
+        -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
 done
@@ -127,8 +134,14 @@ connect() {
         cp "$HERE/support/apple_gpu.py" "$CONF_DIR/apple_gpu.py"
         wrapper="$CONF_DIR/apple_gpu.py"
     fi
-    cp "$HERE/support/roto_daemon.py" "$CONF_DIR/roto_daemon.py"   # SAM 2 worker for the Roto node
-    cp "$HERE/support/roto_picker.py" "$CONF_DIR/roto_picker.py"   # the Roto node's picker window
+    cp "$HERE/support/roto_daemon.py" "$CONF_DIR/roto_daemon.py"   # SAM worker (Hint + Roto nodes)
+    cp "$HERE/support/roto_picker.py" "$CONF_DIR/roto_picker.py"   # the picker window
+    cp "$HERE/support/ck2_masks.py" "$CONF_DIR/ck2_masks.py"       # lasso, SAM 3, MatAnyone 2, shapes
+    cp "$HERE/support/setup_roto_env.py" "$CONF_DIR/setup_roto_env.py"
+    # settings the user added by hand (or ck2-gui) survive reconnecting
+    local keep=""
+    if [[ -f "$CONF" ]]; then keep="$(grep -E '^(hf_token|auto_refresh)=' "$CONF" || true)"; fi
+    if [[ -n "$HF_TOKEN_ARG" ]]; then keep="$(printf '%s\n' "$keep" | grep -v '^hf_token=' || true)"$'\n'"hf_token=$HF_TOKEN_ARG"; fi
     ff="$FFMPEG"                         # the engine needs ffmpeg even for EXR output
     [[ -n "$ff" && -x "$ff" ]] || ff="$(command -v ffmpeg || true)"
     if [[ -z "$ff" ]]; then
@@ -146,6 +159,7 @@ connect() {
         echo "roto_daemon=$CONF_DIR/roto_daemon.py"
         echo "roto_picker=$CONF_DIR/roto_picker.py"
         echo "sam_model=$SAM_MODEL"
+        if [[ -n "$keep" ]]; then printf '%s\n' "$keep" | sed '/^$/d'; fi
     } > "$CONF"
     ok "Connected: wrote $CONF"
 }
@@ -188,7 +202,7 @@ else
     fi
     say "Building (the first build downloads the OpenFX SDK, ~1 min)"
     gen=(); command -v ninja >/dev/null && gen=(-G Ninja)
-    cmake -S "$HERE" -B "$BUILD" "${gen[@]}" -DCMAKE_BUILD_TYPE=Release
+    cmake -S "$HERE" -B "$BUILD" ${gen[@]+"${gen[@]}"} -DCMAKE_BUILD_TYPE=Release
     cmake --build "$BUILD" --config Release --parallel
 fi
 [[ -d "$BUILD/$BUNDLE/Contents" ]] || die "Build failed – use 'Report a bug' in ck2-gui (or paste the output above)."
@@ -210,25 +224,45 @@ ok "Fusion macro: $MACRO_DIR/CorridorKey Outputs.setting"
 
 # ---------------------------------------------------------------- picker window needs PySide6
 if ! "$PY" -c "import PySide6" 2>/dev/null; then
-    say "Adding PySide6 to the engine's Python (for the Roto picker window)"
+    say "Adding PySide6 to the engine's Python (for the picker window)"
     if command -v uv >/dev/null; then
-        uv pip install --python "$PY" "PySide6>=6.7" || echo "   warning: PySide6 install failed – the Roto picker won't open"
+        uv pip install --python "$PY" "PySide6>=6.7" || echo "   warning: PySide6 install failed – the picker won't open"
     else
-        "$PY" -m pip install "PySide6>=6.7" || echo "   warning: PySide6 install failed – the Roto picker won't open"
+        "$PY" -m pip install "PySide6>=6.7" || echo "   warning: PySide6 install failed – the picker won't open"
     fi
 fi
 
-# ---------------------------------------------------------------- SAM 2 model for the Roto node
+# ---------------------------------------------------------------- Roto models (own environment)
+if [[ $ROTO == 1 ]]; then
+    ma_args=()
+    if [[ $MATANYONE == 1 ]]; then
+        echo
+        "$PY" -c "import sys; sys.path.insert(0, '$HERE/support'); import setup_roto_env as s; print(s.LICENSE_NOTE)"
+        if [[ $MA_ACCEPT == 0 ]]; then
+            [[ $GUI == 0 ]] || die "MatAnyone 2 needs --accept-matanyone-license (non-commercial licence)."
+            read -r -p "Install MatAnyone 2 under this NON-COMMERCIAL licence? [y/N] " a
+            [[ "$a" == [yY]* ]] || { MATANYONE=0; echo "   MatAnyone 2 skipped: the Roto node uses SAM edges."; }
+        fi
+        [[ $MATANYONE == 0 ]] || ma_args=(--matanyone --accept-matanyone-license)
+    fi
+    say "Installing the Roto models into $ENGINE/roto-env (a few GB the first time)"
+    uv_arg=(); command -v uv >/dev/null && uv_arg=(--uv "$(command -v uv)")
+    "$PY" "$HERE/support/setup_roto_env.py" --engine "$ENGINE" ${uv_arg[@]+"${uv_arg[@]}"} ${ma_args[@]+"${ma_args[@]}"} \
+        || die "Installing the Roto models failed (see above)."
+    ok "Roto models ready"
+fi
+
+# ---------------------------------------------------------------- SAM 2 model for the Hint node
 if [[ $SAM == 1 ]]; then
     if "$PY" -c "import transformers; transformers.Sam2VideoModel" 2>/dev/null; then
-        say "Downloading $SAM_MODEL for the Roto node (once, ~0.9 GB; skip with --no-sam)"
+        say "Downloading $SAM_MODEL for the Hint node (once, ~0.9 GB; skip with --no-sam)"
         if "$PY" -c "from huggingface_hub import snapshot_download as d; d('$SAM_MODEL')" 2>"$CONF_DIR/sam_download.log"; then
             ok "SAM 2 model ready"
         else
-            echo "   warning: couldn't download $SAM_MODEL now; the Roto node will try on first use (details: $CONF_DIR/sam_download.log)"
+            echo "   warning: couldn't download $SAM_MODEL now; the Hint node will try on first use (details: $CONF_DIR/sam_download.log)"
         fi
     else
-        echo "   warning: this engine's transformers has no SAM 2 – the Roto node needs:"
+        echo "   warning: this engine's transformers has no SAM 2 – the Hint node needs:"
         echo "            $PY -m pip install -U 'transformers>=4.56'"
     fi
 fi
@@ -237,7 +271,8 @@ cat <<EOF
 
 Done. Next:
   1. Restart DaVinci Resolve.
-  2. Effects → OpenFX → Keying: CorridorKey 2.0, CorridorKey Pass, CorridorKey Roto.
+  2. Effects → OpenFX → Keying: CorridorKey 2.0, CorridorKey Pass, CorridorKey Hint,
+     CorridorKey Roto (Roto needs: bash install.sh --roto [--matanyone]).
      Fusion page: Add Tool → Macros → CorridorKey Outputs (Cutout/Alpha/FG/Checker outputs).
-  3. Press "Key clip" in the Inspector, then play the clip once.
+  3. Press "Key clip" in the Inspector; it reads the clip's frames by itself.
 EOF

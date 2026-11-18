@@ -1,7 +1,7 @@
 {
   "name": "CorridorKey for DaVinci Resolve",
   "app": "DaVinci Resolve 21+ (Free and Studio)",
-  "description": "Key, Roto (SAM 2 click-to-track) and Pass nodes for the Edit, Color and Fusion pages, plus a multi-output Fusion macro.",
+  "description": "Key, Hint (SAM click-to-track helper matte), Roto (SAM 2/3 + MatAnyone 2 soft edges, Fusion shapes) and Pass nodes, plus a multi-output Fusion macro.",
   "platforms": ["linux", "windows", "macos"],
   "asset": "ck2-davinci-plugin-*.zip",
   "install": {

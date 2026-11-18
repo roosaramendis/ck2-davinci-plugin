@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""SAM 2.1 worker for the CorridorKey Roto node (runs in the engine's venv).
+"""SAM worker for the CorridorKey Hint and Roto nodes.
+
+Hint node: runs in the engine's venv (SAM 2.1) and writes hint masks.
+Roto node: runs in <engine>/roto-env (SAM 2.1 / SAM 3 + MatAnyone 2) and writes
+soft alpha mattes plus editable shapes (<job>/shapes.setting for Fusion).
 
 Started in the background by the plugin; one per cache folder. It watches
 <root>/<job>/ for request files, so Resolve never waits on it, and quits after a
@@ -8,12 +12,15 @@ few idle minutes to give the GPU memory back.
   <job>/preview/request.json  {"seq", "frame", "objects", "model"}
       -> <job>/preview/mask_<frame>.exr (+ .png for the picker window),
          <job>/preview/done.json {"seq", "error"?}
-  <job>/request.json          {"seq", "kind": "track", "frame", "objects", "model", "count"}
+  <job>/request.json          {"seq", "kind": "track", "frame", "objects", "model", "count",
+                               "matte": "matanyone"|"sam" (Roto only), "t0", "max_side"}
       -> <job>/masks/mask_NNNNNN.exr, progress "window i/N" in engine.log, exitcode
+         (Roto: soft alpha mattes, and <job>/shapes.setting)
   <job>/cancel                stop tracking
 
-objects = [{"points": [[x, y, 1|0], ...], "box": [x0, y0, x1, y1] | null}, ...]: one entry
-per thing to keep (each rectangle is its own object). Coordinates are pixels of
+objects = [{"points": [[x, y, 1|0], ...], "box": [x0, y0, x1, y1] | null,
+            "regions": [lassos, see ck2_masks.py]}, ...]: one entry per thing to keep
+(each rectangle is its own object). Coordinates are pixels of
 the full frame, top-left origin. Masks are SAM
 probabilities (0..1) at the reduced working size (long side <= 1280).
 """
@@ -32,6 +39,8 @@ os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+
+import ck2_masks as M  # noqa: E402  (next to this file)
 
 ROOT = Path(sys.argv[1])
 DEFAULT_MODEL = sys.argv[2] if len(sys.argv) > 2 else "facebook/sam2.1-hiera-large"
@@ -104,38 +113,23 @@ class Sam:
             model = T.Sam2VideoModel(T.Sam2VideoConfig())
             self.proc = T.Sam2VideoProcessor(image_processor=T.Sam2ImageProcessorFast(),
                                              video_processor=T.Sam2VideoVideoProcessor())
+            self.model = model.to(self.device, dtype=self.dtype).eval()
         else:
-            try:  # already downloaded: no network (a flaky connection only slows things down)
-                model = T.Sam2VideoModel.from_pretrained(name, local_files_only=True)
-                self.proc = T.Sam2VideoProcessor.from_pretrained(name, local_files_only=True)
-            except OSError:
-                print(f"[roto] downloading {name} (once)", flush=True)
-                model = T.Sam2VideoModel.from_pretrained(name)
-                self.proc = T.Sam2VideoProcessor.from_pretrained(name)
-        self.model = model.to(self.device, dtype=self.dtype).eval()
+            self.model, self.proc = M.load_sam(name, self.device, self.dtype)
         self.name = name
 
     def session(self, images):
         return self.proc.init_video_session(video=images, inference_device=self.device,
                                             video_storage_device="cpu", dtype=self.dtype)
 
-    def add_objects(self, s, frame: int, objects, scale: float):
-        """One SAM object per entry; returns the last model output (or None)."""
+    def add_objects(self, s, frame: int, objects, scale: float, w: int, h: int):
+        """One SAM object per entry (points, box, lassos); returns the last model output."""
         out = None
         for oid, ob in enumerate(objects, start=1):
-            kw = {}
-            pts = ob.get("points") or []
-            if pts:
-                kw["input_points"] = [[[[float(x) * scale, float(y) * scale] for x, y, _ in pts]]]
-                kw["input_labels"] = [[[int(l) for _, _, l in pts]]]
-            if ob.get("box"):
-                kw["input_boxes"] = [[[float(v) * scale for v in ob["box"]]]]
-            if not ob.get("box") and not any(int(l) == 1 for _, _, l in pts):
-                continue  # only "remove" points: nothing to keep
-            self.proc.add_inputs_to_inference_session(s, frame, oid, **kw)
-            out = self.model(inference_session=s, frame_idx=frame)  # must follow each add
+            o = M.add_object(self.proc, self.model, s, frame, oid, ob, scale, w, h)
+            out = o if o is not None else out
         if out is None:
-            raise ValueError("nothing to keep: click on the character or drag a box around it")
+            raise ValueError("nothing to keep: click on what you want, or drag a box or a lasso around it")
         return out
 
     def prob(self, pred_masks, w: int, h: int) -> np.ndarray:
@@ -145,7 +139,7 @@ class Sam:
         return p.numpy().astype(np.float32)
 
 
-def load_rgb8(exr: Path, linear: bool):
+def load_rgb8(exr: Path, linear: bool, max_side: int = MAX_SIDE):
     """Captured EXR (RGB, display-referred unless linear) -> 8-bit RGB at working size."""
     img = cv2.imread(str(exr), cv2.IMREAD_UNCHANGED)
     if img is None:
@@ -155,7 +149,7 @@ def load_rgb8(exr: Path, linear: bool):
         a = np.abs(img)
         img = np.where(a <= 0.0031308, a * 12.92, 1.055 * np.power(a, 1 / 2.4) - 0.055)
     h, w = img.shape[:2]
-    scale = min(1.0, MAX_SIDE / max(w, h))
+    scale = min(1.0, max_side / max(w, h))
     if scale < 1.0:
         img = cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
     return (np.clip(img, 0, 1) * 255).round().astype(np.uint8), scale
@@ -174,11 +168,11 @@ def do_preview(sam: Sam, job: Path, req: dict):
     frame = int(req["frame"])
     try:
         sam.load(req.get("model") or DEFAULT_MODEL)
-        rgb, scale = load_rgb8(pv / f"src_{frame:06d}.exr", job_linear(job))
+        rgb, scale = load_rgb8(pv / f"src_{frame:06d}.exr", job_linear(job), int(req.get("max_side") or MAX_SIDE))
         h, w = rgb.shape[:2]
         with torch.inference_mode():
             s = sam.session([Image.fromarray(rgb)])
-            sam.add_objects(s, 0, objects_of(req), scale)
+            sam.add_objects(s, 0, objects_of(req), scale, w, h)
             out = sam.model(inference_session=s, frame_idx=0)  # all objects together
             prob = sam.prob(out.pred_masks, w, h)
         cv2.imwrite(str(pv / f"mask_{frame:06d}.exr.tmp.exr"), prob, EXR_HALF)
@@ -193,7 +187,7 @@ def do_preview(sam: Sam, job: Path, req: dict):
                                                    "error": f"{type(e).__name__}: {e}"}))
 
 
-def build_sam_frames(job: Path, first: int, count: int):
+def build_sam_frames(job: Path, first: int, count: int, max_side: int = MAX_SIDE):
     """Captured EXRs (frames first..first+count-1) -> small JPEGs kept for
     re-tracking; EXRs deleted. An existing set is reused."""
     sf = job / "sam"
@@ -207,11 +201,11 @@ def build_sam_frames(job: Path, first: int, count: int):
     for i in range(count):
         if (job / "cancel").exists() or not job.is_dir():
             raise KeyboardInterrupt
-        rgb, scale = load_rgb8(job / "src" / f"frame_{first + i:06d}.exr", linear)
+        rgb, scale = load_rgb8(job / "src" / f"frame_{first + i:06d}.exr", linear, max_side)
         cv2.imwrite(str(sf / f"{i:06d}.jpg"), rgb[..., ::-1], [cv2.IMWRITE_JPEG_QUALITY, 93])
         if i % 20 == 0:
             log(job, f"[roto] preparing frames {i + 1}/{count}")
-    info = {"first": first, "n": count, "scale": scale}
+    info = {"first": first, "n": count, "scale": scale, "max_side": max_side}
     atomic_write(sf / "info.json", json.dumps(info))
     for p in (job / "src").glob("*.exr"):
         p.unlink()
@@ -222,11 +216,14 @@ def notify(job: Path, ok: bool):
     """Desktop notification when tracking ends, if the node asked for one (<job>/notify)."""
     import shutil
     import subprocess
-    if not (job / "notify").exists():
+    try:
+        node = (job / "notify").read_text().splitlines()[0].strip() or "CorridorKey Hint"
+    except (OSError, IndexError):
         return
-    title = "CorridorKey Roto: tracking " + ("done" if ok else "failed")
-    body = ("Now press Key clip on the CorridorKey node." if ok
-            else "See the Status line on the Roto node for details.")
+    title = f"{node}: tracking " + ("done" if ok else "failed")
+    body = ("Now press Key clip on the CorridorKey node." if ok and "Hint" in node
+            else "The roto matte is ready." if ok
+            else f"See the Status line on the {node.replace('CorridorKey ', '')} node for details.")
     try:
         env = {k: v for k, v in os.environ.items()
                if not k.upper().startswith(("LD_", "QT_", "PYTHON", "DYLD_"))}
@@ -261,36 +258,79 @@ def notify(job: Path, ok: bool):
 def do_track(sam: Sam, job: Path, req: dict):
     from PIL import Image
     code = "1"
+    matte = req.get("matte")  # Roto node: "matanyone" | "sam"; Hint node: None
     try:
-        info = build_sam_frames(job, int(req.get("first", 0)), int(req["count"]))
+        max_side = int(req.get("max_side") or MAX_SIDE)
+        info = build_sam_frames(job, int(req.get("first", 0)), int(req["count"]), max_side)
         first, n = int(info["first"]), int(info["n"])
         frame = int(req["frame"]) - first  # index inside the tracked range
         if not 0 <= frame < n:
             raise ValueError(f"the picked frame {frame + first} is outside the captured frames "
                              f"{first}-{first + n - 1}; pick on a frame inside them")
+        env_dir = Path(sys.prefix)  # <engine>/roto-env when run by the Roto node
+        use_ma = matte == "matanyone" and M.matanyone_ready(env_dir)
+        if matte == "matanyone" and not use_ma:
+            log(job, "[roto] MatAnyone 2 isn't installed: edges come from SAM (install it with the "
+                     "Roto models in ck2-gui Setup, or install.sh --roto --matanyone)")
+        steps = n * (2 if use_ma else 1)  # progress: SAM pass (+ MatAnyone pass)
         sam.load(req.get("model") or DEFAULT_MODEL)
         files = sorted((job / "sam").glob("*.jpg"))
         imgs = [Image.open(p).convert("RGB") for p in files]
         w, h = imgs[0].size
         out = job / "masks"
         out.mkdir(exist_ok=True)
+        objs = objects_of(req)
+        per_obj = {} if matte else None  # Roto: each object's mask, for the shapes
         done = 0
         log(job, f"[roto] tracking frames {first}-{first + n - 1} from frame {frame + first} "
-                 f"with {sam.name} on {sam.device}")
+                 f"with {sam.name} on {sam.device}" + (" + MatAnyone 2" if use_ma else ""))
         with torch.inference_mode():
             s = sam.session(imgs)
             del imgs
-            sam.add_objects(s, frame, objects_of(req), info["scale"])
+            sam.add_objects(s, frame, objs, info["scale"], w, h)
             for rev in (False, True):
                 for o in sam.model.propagate_in_video_iterator(s, start_frame_idx=frame, reverse=rev):
                     if (job / "cancel").exists() or not job.is_dir():
                         raise KeyboardInterrupt
+                    prob = sam.prob(o.pred_masks, w, h)
                     p = out / f"mask_{first + o.frame_idx:06d}.exr"
-                    cv2.imwrite(str(p) + ".tmp.exr", sam.prob(o.pred_masks, w, h), EXR_HALF)
+                    cv2.imwrite(str(p) + ".tmp.exr", prob, EXR_HALF)
                     replace_retry(Path(str(p) + ".tmp.exr"), p)
+                    if per_obj is not None:
+                        for oid in s.obj_ids:
+                            m = M.object_prob(sam.proc, o, s, oid, w, h) >= 0.5
+                            per_obj.setdefault(oid, {})[o.frame_idx] = m.astype(np.uint8)
                     done += 1
                     if done % 4 == 0 or done >= n:
-                        log(job, f"      window {min(done, n)}/{n}")
+                        log(job, f"      window {min(done, n)}/{steps}")
+            anchor = cv2.imread(str(out / f"mask_{first + frame:06d}.exr"), cv2.IMREAD_UNCHANGED)
+        if use_ma:
+            del s
+            if sam.device == "cuda":
+                torch.cuda.empty_cache()
+            log(job, "[roto] soft edges with MatAnyone 2 (hair, motion blur)")
+            mt = M.Matter(M.matanyone_weights(env_dir), sam.device)
+
+            def write(i, a):
+                p = out / f"mask_{first + i:06d}.exr"
+                cv2.imwrite(str(p) + ".tmp.exr", a, EXR_HALF)
+                replace_retry(Path(str(p) + ".tmp.exr"), p)
+
+            def progress(k):
+                if k % 4 == 0 or k >= n:
+                    log(job, f"      window {n + min(k, n)}/{steps}")
+
+            mt.run(files, frame, (anchor >= 0.5).astype(np.uint8), write,
+                   cancelled=lambda: (job / "cancel").exists() or not job.is_dir(),
+                   max_short=min(1080, min(w, h)), progress=progress)
+            del mt
+        if per_obj:
+            t0 = int(round(float(req.get("t0", 0))))
+            shapes = {f"Object {oid}": {t0 + first + f: pts for f, pts in M.track_shape(fr).items()}
+                      for oid, fr in sorted(per_obj.items())}
+            full_w, full_h = round(w / info["scale"]), round(h / info["scale"])
+            atomic_write(job / "shapes.setting", M.fusion_setting(shapes, full_w, full_h, info["scale"]))
+            log(job, f"[roto] shapes: {sum(len(v) for v in shapes.values())} keyframes in shapes.setting")
         code = "0"
     except KeyboardInterrupt:
         code = "cancelled"

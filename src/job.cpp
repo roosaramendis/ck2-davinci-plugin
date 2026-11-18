@@ -919,7 +919,7 @@ bool startRotoTrackLocked(const std::string& root, const std::string& id, const 
         auto m = jobMem(root, id);
         start = m->spec.start;
         o << "\"matte\": \"" << (matte == "sam" ? "sam" : "matanyone") << "\", \"t0\": " << start
-          << ", \"max_side\": 1920, ";
+          << ", \"max_side\": 0, ";  // 0: full resolution (SAM still gets its own 1024 copy)
     }
     o << body;
     writeTextAtomic(joinPath(dir, "launched"), std::to_string(first) + " " + std::to_string(count) + "\n");

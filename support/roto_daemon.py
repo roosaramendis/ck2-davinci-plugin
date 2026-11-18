@@ -149,7 +149,7 @@ def load_rgb8(exr: Path, linear: bool, max_side: int = MAX_SIDE):
         a = np.abs(img)
         img = np.where(a <= 0.0031308, a * 12.92, 1.055 * np.power(a, 1 / 2.4) - 0.055)
     h, w = img.shape[:2]
-    scale = min(1.0, max_side / max(w, h))
+    scale = min(1.0, max_side / max(w, h)) if max_side > 0 else 1.0  # 0: full resolution (Roto)
     if scale < 1.0:
         img = cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
     return (np.clip(img, 0, 1) * 255).round().astype(np.uint8), scale
@@ -168,13 +168,16 @@ def do_preview(sam: Sam, job: Path, req: dict):
     frame = int(req["frame"])
     try:
         sam.load(req.get("model") or DEFAULT_MODEL)
-        rgb, scale = load_rgb8(pv / f"src_{frame:06d}.exr", job_linear(job), int(req.get("max_side") or MAX_SIDE))
+        rgb, scale = load_rgb8(pv / f"src_{frame:06d}.exr", job_linear(job), max_side_of(req))
         h, w = rgb.shape[:2]
+        img, sam_scale = M.sam_copy(rgb)
+        objs = objects_of(req)
+        exact = {oid: M.exact_regions(ob, scale) for oid, ob in enumerate(objs, start=1)}
         with torch.inference_mode():
-            s = sam.session([Image.fromarray(rgb)])
-            sam.add_objects(s, 0, objects_of(req), scale, w, h)
+            s = sam.session([img])
+            sam.add_objects(s, 0, objs, scale * sam_scale, img.size[0], img.size[1])
             out = sam.model(inference_session=s, frame_idx=0)  # all objects together
-            prob = sam.prob(out.pred_masks, w, h)
+            prob, _ = M.frame_probs(sam.proc, out, s, w, h, {k: v for k, v in exact.items() if v})
         cv2.imwrite(str(pv / f"mask_{frame:06d}.exr.tmp.exr"), prob, EXR_HALF)
         replace_retry(pv / f"mask_{frame:06d}.exr.tmp.exr", pv / f"mask_{frame:06d}.exr")
         cv2.imwrite(str(pv / "mask_view.tmp.png"), (np.clip(prob, 0, 1) * 255).round().astype(np.uint8))
@@ -187,9 +190,14 @@ def do_preview(sam: Sam, job: Path, req: dict):
                                                    "error": f"{type(e).__name__}: {e}"}))
 
 
+def max_side_of(req: dict) -> int:
+    v = req.get("max_side")
+    return MAX_SIDE if v is None else int(v)  # 0: full resolution (the Roto node)
+
+
 def build_sam_frames(job: Path, first: int, count: int, max_side: int = MAX_SIDE):
-    """Captured EXRs (frames first..first+count-1) -> small JPEGs kept for
-    re-tracking; EXRs deleted. An existing set is reused."""
+    """Captured EXRs (frames first..first+count-1) -> JPEGs kept for re-tracking (Hint: at most
+    max_side wide; Roto: full resolution); EXRs deleted. An existing set is reused."""
     sf = job / "sam"
     if (sf / "info.json").exists():
         info = read_json(sf / "info.json")
@@ -202,7 +210,8 @@ def build_sam_frames(job: Path, first: int, count: int, max_side: int = MAX_SIDE
         if (job / "cancel").exists() or not job.is_dir():
             raise KeyboardInterrupt
         rgb, scale = load_rgb8(job / "src" / f"frame_{first + i:06d}.exr", linear, max_side)
-        cv2.imwrite(str(sf / f"{i:06d}.jpg"), rgb[..., ::-1], [cv2.IMWRITE_JPEG_QUALITY, 93])
+        cv2.imwrite(str(sf / f"{i:06d}.jpg"), rgb[..., ::-1],
+                    [cv2.IMWRITE_JPEG_QUALITY, 97 if max_side <= 0 else 93])
         if i % 20 == 0:
             log(job, f"[roto] preparing frames {i + 1}/{count}")
     info = {"first": first, "n": count, "scale": scale, "max_side": max_side}
@@ -260,7 +269,7 @@ def do_track(sam: Sam, job: Path, req: dict):
     code = "1"
     matte = req.get("matte")  # Roto node: "matanyone" | "sam"; Hint node: None
     try:
-        max_side = int(req.get("max_side") or MAX_SIDE)
+        max_side = max_side_of(req)
         info = build_sam_frames(job, int(req.get("first", 0)), int(req["count"]), max_side)
         first, n = int(info["first"]), int(info["n"])
         frame = int(req["frame"]) - first  # index inside the tracked range
@@ -275,31 +284,43 @@ def do_track(sam: Sam, job: Path, req: dict):
         steps = n * (2 if use_ma else 1)  # progress: SAM pass (+ MatAnyone pass)
         sam.load(req.get("model") or DEFAULT_MODEL)
         files = sorted((job / "sam").glob("*.jpg"))
-        imgs = [Image.open(p).convert("RGB") for p in files]
-        w, h = imgs[0].size
+        imgs, sam_scale = [], 1.0
+        for p in files:  # one at a time: only SAM's own size stays in memory
+            im, sam_scale = M.sam_copy(Image.open(p).convert("RGB"))
+            imgs.append(im)
+        with Image.open(files[0]) as im0:
+            w, h = im0.size  # the masks are made at this size (Roto: full resolution)
+        sw, sh = imgs[0].size
         out = job / "masks"
         out.mkdir(exist_ok=True)
         objs = objects_of(req)
-        per_obj = {} if matte else None  # Roto: each object's mask, for the shapes
+        exact = {oid: M.exact_regions(ob, info["scale"]) for oid, ob in enumerate(objs, start=1)}
+        exact = {k: v for k, v in exact.items() if v}
+        per_dir = job / "objects" if matte else None  # Roto: each object's mask, for the shapes
+        if per_dir is not None:
+            import shutil
+            shutil.rmtree(per_dir, ignore_errors=True)
         done = 0
         log(job, f"[roto] tracking frames {first}-{first + n - 1} from frame {frame + first} "
-                 f"with {sam.name} on {sam.device}" + (" + MatAnyone 2" if use_ma else ""))
+                 f"with {sam.name} on {sam.device}, masks at {w}x{h}" + (" + MatAnyone 2" if use_ma else ""))
         with torch.inference_mode():
             s = sam.session(imgs)
             del imgs
-            sam.add_objects(s, frame, objs, info["scale"], w, h)
+            sam.add_objects(s, frame, objs, info["scale"] * sam_scale, sw, sh)
             for rev in (False, True):
                 for o in sam.model.propagate_in_video_iterator(s, start_frame_idx=frame, reverse=rev):
                     if (job / "cancel").exists() or not job.is_dir():
                         raise KeyboardInterrupt
-                    prob = sam.prob(o.pred_masks, w, h)
+                    prob, per = M.frame_probs(sam.proc, o, s, w, h, exact if o.frame_idx == frame else None)
                     p = out / f"mask_{first + o.frame_idx:06d}.exr"
                     cv2.imwrite(str(p) + ".tmp.exr", prob, EXR_HALF)
                     replace_retry(Path(str(p) + ".tmp.exr"), p)
-                    if per_obj is not None:
-                        for oid in s.obj_ids:
-                            m = M.object_prob(sam.proc, o, s, oid, w, h) >= 0.5
-                            per_obj.setdefault(oid, {})[o.frame_idx] = m.astype(np.uint8)
+                    if per_dir is not None:
+                        for oid, po in per.items():
+                            d = per_dir / str(oid)
+                            d.mkdir(parents=True, exist_ok=True)
+                            cv2.imwrite(str(d / f"{o.frame_idx:06d}.png"), (po >= 0.5).astype(np.uint8) * 255)
+                    del prob, per
                     done += 1
                     if done % 4 == 0 or done >= n:
                         log(job, f"      window {min(done, n)}/{steps}")
@@ -320,14 +341,15 @@ def do_track(sam: Sam, job: Path, req: dict):
                 if k % 4 == 0 or k >= n:
                     log(job, f"      window {n + min(k, n)}/{steps}")
 
-            mt.run(files, frame, (anchor >= 0.5).astype(np.uint8), write,
-                   cancelled=lambda: (job / "cancel").exists() or not job.is_dir(),
-                   max_short=min(1080, min(w, h)), progress=progress)
+            used = mt.run_full(files, frame, (anchor >= 0.5).astype(np.uint8), write,
+                               cancelled=lambda: (job / "cancel").exists() or not job.is_dir(),
+                               progress=progress, log=lambda t: log(job, t))
+            log(job, f"[roto] MatAnyone 2 at {'full resolution' if used is None else f'{used} lines'}")
             del mt
-        if per_obj:
+        if per_dir is not None and per_dir.is_dir():
             t0 = int(round(float(req.get("t0", 0))))
-            shapes = {f"Object {oid}": {t0 + first + f: pts for f, pts in M.track_shape(fr).items()}
-                      for oid, fr in sorted(per_obj.items())}
+            shapes = {f"Object {d.name}": {t0 + first + f: pts for f, pts in M.track_shape(M.MaskFolder(d)).items()}
+                      for d in sorted((x for x in per_dir.iterdir() if x.is_dir()), key=lambda x: int(x.name))}
             full_w, full_h = round(w / info["scale"]), round(h / info["scale"])
             atomic_write(job / "shapes.setting", M.fusion_setting(shapes, full_w, full_h, info["scale"]))
             log(job, f"[roto] shapes: {sum(len(v) for v in shapes.values())} keyframes in shapes.setting")

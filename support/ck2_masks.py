@@ -136,6 +136,60 @@ def object_prob(proc, out, session, oid: int, w: int, h: int) -> np.ndarray:
     return torch.sigmoid(m[idx, 0]).numpy().astype(np.float32)
 
 
+SAM_SHORT = 1024  # SAM resizes every frame to 1024 x 1024 inside: more pixels never reach it
+
+
+def sam_copy(img, short: int = SAM_SHORT):
+    """(RGB image for SAM, scale). Big frames are shrunk only to what SAM uses anyway (short
+    side 1024), so 4K clips don't fill the memory; masks are still made at full size."""
+    from PIL import Image
+    if isinstance(img, np.ndarray):
+        img = Image.fromarray(img)
+    w, h = img.size
+    s = min(1.0, short / min(w, h))
+    if s < 1.0:
+        img = img.resize((max(1, round(w * s)), max(1, round(h * s))), Image.Resampling.LANCZOS)
+    return img, s
+
+
+def exact_regions(ob: dict, scale: float = 1.0) -> list:
+    return [r for r in parts(ob, scale)[2] if r["exact"]]
+
+
+def frame_probs(proc, out, session, w: int, h: int, exact: dict | None = None):
+    """(union, {object id: probability}) at w x h, any size: SAM's mask is scaled straight to
+    it. exact = {object id: exact lassos in w x h coords} for this frame: their edges are drawn
+    again at this size, so a lasso is pixel-exact at full resolution."""
+    import torch
+    m = proc.post_process_masks([out.pred_masks.float().cpu()], original_sizes=[[h, w]], binarize=False)[0]
+    per = {}
+    for oid in session.obj_ids:
+        idx = session.obj_id_to_idx(oid)
+        p = (torch.sigmoid(m[idx, 0]).numpy().astype(np.float32) if idx < m.shape[0]
+             else np.zeros((h, w), np.float32))
+        regs = (exact or {}).get(oid)
+        per[oid] = compose(p, regs, w, h) if regs else p
+    del m
+    union = np.maximum.reduce(list(per.values())) if per else np.zeros((h, w), np.float32)
+    return union, per
+
+
+class MaskFolder:
+    """frame -> 0/1 mask, read from <dir>/<frame>.png only when asked (long 4K clips)."""
+
+    def __init__(self, folder: Path):
+        self.files = {int(p.stem): p for p in Path(folder).glob("*.png")}
+
+    def __iter__(self):
+        return iter(self.files)
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, f):
+        return (cv2.imread(str(self.files[f]), cv2.IMREAD_GRAYSCALE) >= 128).astype(np.uint8)
+
+
 def all_prob(proc, pred_masks, w: int, h: int) -> np.ndarray:
     """All objects together (max)."""
     import torch
@@ -222,11 +276,30 @@ class Matter:
         self.model = MatAnyone2(cfg, single_object=True).to(self.device).eval()
         self.model.load_weights(torch.load(str(weights), map_location=self.device))
 
+    def run_full(self, frames: list, anchor: int, mask: np.ndarray, write, cancelled=lambda: False,
+                 progress=lambda i: None, log=print):
+        """run() at the frames' full resolution. If the GPU runs out of memory, it tries again
+        smaller (2160, 1440, 1080 lines) and says so. Returns the lines used (None: full)."""
+        h, w = cv2.imread(str(frames[anchor])).shape[:2]
+        tries = [None] + [n for n in (2160, 1440, 1080) if n < min(w, h)]
+        for k, max_short in enumerate(tries):
+            try:
+                self.run(frames, anchor, mask, write, cancelled, max_short=max_short, progress=progress)
+                return max_short
+            except Exception as e:
+                oom = isinstance(e, self.torch.OutOfMemoryError) or "out of memory" in str(e).lower()
+                if not oom or k == len(tries) - 1:
+                    raise
+                self.torch.cuda.empty_cache() if self.device.type == "cuda" else None
+                log(f"[roto] MatAnyone 2: not enough GPU memory at {f'{min(w, h)}' if max_short is None else max_short} "
+                    f"lines, trying {tries[k + 1]} (the matte is scaled back up to {w}x{h})")
+
     def run(self, frames: list, anchor: int, mask: np.ndarray, write, cancelled=lambda: False,
-            max_short: int = 1080, warmup: int = 10, progress=lambda i: None):
+            max_short: int | None = None, warmup: int = 10, progress=lambda i: None):
         """frames: image paths (any size, RGB/BGR files); mask: 0/1 at frame size, on frame
         `anchor`. Goes forward from anchor to the end, then backward to the start.
-        write(i, alpha float32 (h, w) at the frames' size)."""
+        write(i, alpha float32 (h, w) at the frames' size). max_short: work at most this many
+        lines (None: full resolution)."""
         torch = self.torch
         from matanyone2.inference.inference_core import InferenceCore
         from matanyone2.utils.device import safe_autocast
@@ -234,7 +307,7 @@ class Matter:
 
         first = cv2.imread(str(frames[anchor]))
         h, w = first.shape[:2]
-        s = min(1.0, max_short / min(w, h))
+        s = min(1.0, max_short / min(w, h)) if max_short else 1.0
         nw, nh = max(16, round(w * s)), max(16, round(h * s))
 
         def load(i):
